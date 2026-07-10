@@ -1,0 +1,77 @@
+{
+  "name": "lanchatroom",
+  "version": "1.0.0",
+  "description": "A LAN chatroom - a digital renaissance of the space age.",
+  "license": "MIT",
+  "author": "ljh32768 with AI",
+  "type": "commonjs",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "build": "electron-builder",
+    "preview": "electron .",
+    "dist": "npm run build && electron-builder --win",
+    "dist:portable": "npm run build && electron-builder --win portable",
+    "dist:nsis": "npm run build && electron-builder --win nsis",
+    "dist:nsis:clean": "node -e \"const fs=require('fs'),p=require('path'),os=require('os');fs.rmSync('dist-out',{recursive:true,force:true});fs.rmSync(p.join(process.env.LOCALAPPDATA||'','electron-builder','Cache','nsis-3.0.4.1'),{recursive:true,force:true});try{const t=os.tmpdir();fs.readdirSync(t).filter(f=>f.startsWith('ns')&&f.endsWith('.tmp')).forEach(f=>fs.rmSync(p.join(t,f),{recursive:true,force:true}))}catch{}\" && npm run dist:nsis"
+  },
+  "build": {
+    "appId": "com.lanchatroom.app",
+    "productName": "LANChatroom",
+    "directories": {
+      "output": "dist-build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "dist/**/*",
+      "node_modules/**/*",
+      "package.json",
+      "pages/**/*"
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "language": "2052",
+      "shortcutName": "LANChatroom",
+      "uninstallDisplayName": "LANChatroom 1.0.0"
+    },
+    "compression": "maximum",
+    "electronDownload": {
+      "mirror": "https://npmmirror.com/mirrors/electron/"
+    },
+    "asarUnpack": [
+      "node_modules/sql.js/dist/sql-wasm.wasm"
+    ]
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.3",
+    "concurrently": "^10.0.3",
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3",
+    "vite": "^8.1.3",
+    "wait-on": "^9.0.10"
+  },
+  "dependencies": {
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-router-dom": "^7.18.1",
+    "react-window": "^1.8.11",
+    "sql.js": "^1.14.1",
+    "uuid": "^10.0.0",
+    "zustand": "^5.0.14"
+  }
+}

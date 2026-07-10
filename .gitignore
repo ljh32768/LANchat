@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/
+*.log
+.DS_Store
+.ebcache/
+dist-build/
+dist-out/
+release/
+.build-log.txt
+.defender-check.txt

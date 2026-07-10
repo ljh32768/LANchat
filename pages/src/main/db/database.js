@@ -1,0 +1,358 @@
+// sql.js 数据库封装：在主进程内运行，通过 IPC 暴露给渲染进程。
+// sql.js 为内存数据库，每次写入后持久化到 chat.db 文件。
+const path = require('path');
+const fs = require('fs');
+const { app } = require('electron');
+const initSqlJs = require('sql.js');
+const { SCHEMA_SQL } = require('./schema');
+const { v4: uuidv4 } = require('uuid');
+
+let SQL = null;
+let db = null;
+let dbPath = null;
+let persistTimer = null;
+let pendingPersist = false;
+
+// 把当前内存数据库写入磁盘（防抖 500ms + 原子写入 write-to-temp-then-rename）
+function persist() {
+  if (!db) return;
+  // V6：防抖 —— 500ms 内多次写入只持久化一次，避免每条消息都全量 export
+  pendingPersist = true;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    if (!pendingPersist || !db) return;
+    pendingPersist = false;
+    try {
+      const data = db.export();
+      // V12：原子写入 —— 先写临时文件再 rename，防崩溃损坏 DB
+      const tmp = dbPath + '.tmp';
+      fs.writeFileSync(tmp, Buffer.from(data));
+      fs.renameSync(tmp, dbPath);
+    } catch (e) {
+      console.error('[db] persist failed:', e);
+    }
+  }, 500);
+}
+
+// 强制立即持久化（用于关闭前/重要操作后）
+function persistNow() {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+  pendingPersist = false;
+  if (!db) return;
+  try {
+    const data = db.export();
+    const tmp = dbPath + '.tmp';
+    fs.writeFileSync(tmp, Buffer.from(data));
+    fs.renameSync(tmp, dbPath);
+  } catch (e) {
+    console.error('[db] persistNow failed:', e);
+  }
+}
+
+// V28：版本化数据库迁移（PRAGMA user_version）
+// 每次升级在对应 if (version < N) 块中追加迁移逻辑，并更新 version = N
+function runMigrations() {
+  const versionRow = queryOne('PRAGMA user_version');
+  let version = versionRow?.user_version || 0;
+
+  // v1: 添加 sessions.last_activity_at 列
+  if (version < 1) {
+    try {
+      const cols = query('PRAGMA table_info(sessions)');
+      if (cols.length > 0 && !cols.some((c) => c.name === 'last_activity_at')) {
+        execute('ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER');
+      }
+    } catch (e) {
+      console.error('[db] migration v1 failed:', e);
+    }
+    version = 1;
+  }
+
+  // 未来迁移在此追加：if (version < 2) { ... version = 2; }
+
+  if (db) db.run(`PRAGMA user_version = ${version};`);
+  console.log('[db] migrations done, user_version =', version);
+}
+
+async function initDatabase() {
+  if (db) return db;
+
+  // 加载 sql.js wasm（打包后 asarUnpack 会释放到 app.asar.unpacked）
+  let wasmPath = path.join(
+    process.cwd(),
+    'node_modules',
+    'sql.js',
+    'dist',
+    'sql-wasm.wasm'
+  );
+  // 打包环境：从 __dirname 推算 asar.unpacked 路径
+  if (app.isPackaged) {
+    wasmPath = path.join(
+      process.resourcesPath,
+      'app.asar.unpacked',
+      'node_modules',
+      'sql.js',
+      'dist',
+      'sql-wasm.wasm'
+    );
+  }
+  SQL = await initSqlJs({ locateFile: () => wasmPath });
+
+  // 数据库文件存放于 userData 目录
+  const dataDir = app.getPath('userData');
+  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+  dbPath = path.join(dataDir, 'chat.db');
+
+  if (fs.existsSync(dbPath)) {
+    const fileBuffer = fs.readFileSync(dbPath);
+    db = new SQL.Database(fileBuffer);
+  } else {
+    db = new SQL.Database();
+  }
+
+  db.run(SCHEMA_SQL);
+
+  // V17：启用 SQLite 外键约束（默认关闭）
+  db.run('PRAGMA foreign_keys = ON;');
+
+  // V28：版本化数据库迁移（PRAGMA user_version）
+  runMigrations();
+
+  persist();
+
+  // 首次启动初始化 client_info
+  const row = queryOne('SELECT client_id, nickname, created_at FROM client_info LIMIT 1');
+  if (!row) {
+    const clientId = uuidv4();
+    const now = Date.now();
+    execute(
+      'INSERT INTO client_info (client_id, nickname, created_at) VALUES (?, ?, ?)',
+      [clientId, '指挥官', now]
+    );
+  }
+
+  return db;
+}
+
+// 参数绑定：sql.js 接收数组
+function query(sql, params = []) {
+  if (!db) throw new Error('db not initialized');
+  const stmt = db.prepare(sql);
+  try {
+    stmt.bind(params);
+    const rows = [];
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject());
+    }
+    return rows;
+  } finally {
+    stmt.free();
+  }
+}
+
+function queryOne(sql, params = []) {
+  const rows = query(sql, params);
+  return rows[0] || null;
+}
+
+function execute(sql, params = []) {
+  if (!db) throw new Error('db not initialized');
+  db.run(sql, params);
+  persist();
+  return { changes: db.getRowsModified() };
+}
+
+// ---- 高层业务方法 ----
+
+function getClientInfo() {
+  return queryOne('SELECT client_id, nickname, created_at FROM client_info LIMIT 1');
+}
+
+function setNickname(nickname) {
+  execute('UPDATE client_info SET nickname = ?', [nickname]);
+  return getClientInfo();
+}
+
+function upsertContact({ contact_id, nickname, last_seen_ip, last_seen_at }) {
+  const existing = queryOne('SELECT contact_id FROM contacts WHERE contact_id = ?', [contact_id]);
+  if (existing) {
+    execute(
+      `UPDATE contacts SET nickname = ?, last_seen_ip = ?, last_seen_at = ? WHERE contact_id = ?`,
+      [nickname, last_seen_ip, last_seen_at, contact_id]
+    );
+  } else {
+    execute(
+      `INSERT INTO contacts (contact_id, nickname, last_seen_ip, last_seen_at, is_favorite)
+       VALUES (?, ?, ?, ?, 0)`,
+      [contact_id, nickname, last_seen_ip, last_seen_at]
+    );
+  }
+  return queryOne('SELECT * FROM contacts WHERE contact_id = ?', [contact_id]);
+}
+
+function listContacts() {
+  // 收藏优先 + 按昵称/别名稳定排序 + contact_id 兜底（避免重名时位置互换）
+  return query('SELECT * FROM contacts ORDER BY is_favorite DESC, COALESCE(NULLIF(alias, \'\'), nickname) ASC, contact_id ASC');
+}
+
+function setAlias(contact_id, alias) {
+  execute('UPDATE contacts SET alias = ? WHERE contact_id = ?', [alias, contact_id]);
+}
+
+function toggleFavorite(contact_id) {
+  execute(
+    'UPDATE contacts SET is_favorite = CASE is_favorite WHEN 1 THEN 0 ELSE 1 END WHERE contact_id = ?',
+    [contact_id]
+  );
+}
+
+function listSessions() {
+  return query('SELECT * FROM sessions ORDER BY COALESCE(last_activity_at, created_at) DESC');
+}
+
+function touchSession(session_id) {
+  execute('UPDATE sessions SET last_activity_at = ? WHERE session_id = ?', [Date.now(), session_id]);
+}
+
+function getSession(session_id) {
+  return queryOne('SELECT * FROM sessions WHERE session_id = ?', [session_id]);
+}
+
+function createSession({ session_id, host_contact_id, name, type, status, created_at }) {
+  // 用 INSERT OR REPLACE：重新加入已退出过的会话时覆盖旧记录，保留关联的消息历史
+  execute(
+    `INSERT OR REPLACE INTO sessions (session_id, host_contact_id, name, type, status, created_at, ended_at)
+     VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+    [session_id, host_contact_id, name, type, status, created_at]
+  );
+  return getSession(session_id);
+}
+
+// 成员退出会话：仅删除 sessions 表记录（保留 messages，便于重新加入后查看历史）
+function leaveSession(session_id) {
+  execute('DELETE FROM sessions WHERE session_id = ?', [session_id]);
+}
+
+function closeSession(session_id, ended_at) {
+  execute('UPDATE sessions SET status = ?, ended_at = ? WHERE session_id = ?', [
+    'ended',
+    ended_at,
+    session_id
+  ]);
+}
+
+// 删除已结束会话：级联清理 files → messages → sessions（无 ON DELETE CASCADE，手动删）
+function deleteSession(session_id) {
+  // 先查出该会话所有 message_id，用于删 files
+  const msgs = query('SELECT message_id FROM messages WHERE session_id = ?', [session_id]);
+  if (msgs.length > 0) {
+    const ids = msgs.map((m) => m.message_id);
+    const placeholders = ids.map(() => '?').join(',');
+    execute(`DELETE FROM files WHERE message_id IN (${placeholders})`, ids);
+  }
+  execute('DELETE FROM messages WHERE session_id = ?', [session_id]);
+  execute('DELETE FROM sessions WHERE session_id = ?', [session_id]);
+}
+
+function listMessages(session_id) {
+  // LEFT JOIN contacts 拿 sender_nickname（别名优先），历史消息也能显示发送者名
+  return query(
+    `SELECT m.*, COALESCE(c.alias, c.nickname) AS sender_nickname, c.last_seen_ip AS sender_ip
+     FROM messages m
+     LEFT JOIN contacts c ON m.sender_contact_id = c.contact_id
+     WHERE m.session_id = ? ORDER BY m.timestamp ASC`,
+    [session_id]
+  );
+}
+
+function addMessage({ message_id, session_id, sender_contact_id, content, type, timestamp, local_id }) {
+  // V24：INSERT OR IGNORE 避免 TOCTOU 竞态下 PRIMARY KEY 冲突
+  execute(
+    `INSERT OR IGNORE INTO messages (message_id, session_id, sender_contact_id, content, type, timestamp, local_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [message_id, session_id, sender_contact_id, content, type, timestamp, local_id]
+  );
+  // 更新会话活动时间（用于列表按活动排序）
+  try { touchSession(session_id); } catch {}
+  return queryOne('SELECT * FROM messages WHERE message_id = ?', [message_id]);
+}
+
+function addFile({ file_id, message_id, file_name, file_size, storage_path, download_status }) {
+  execute(
+    `INSERT INTO files (file_id, message_id, file_name, file_size, storage_path, download_status)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [file_id, message_id, file_name, file_size, storage_path, download_status]
+  );
+  return queryOne('SELECT * FROM files WHERE file_id = ?', [file_id]);
+}
+
+function updateFileStatus(file_id, status, storage_path = null) {
+  if (storage_path !== null) {
+    execute('UPDATE files SET download_status = ?, storage_path = ? WHERE file_id = ?', [
+      status,
+      storage_path,
+      file_id
+    ]);
+  } else {
+    execute('UPDATE files SET download_status = ? WHERE file_id = ?', [status, file_id]);
+  }
+}
+
+function listFiles(message_id) {
+  return query('SELECT * FROM files WHERE message_id = ?', [message_id]);
+}
+
+function getSetting(key, defaultValue = null) {
+  const row = queryOne('SELECT value FROM settings WHERE key = ?', [key]);
+  return row ? row.value : defaultValue;
+}
+
+function setSetting(key, value) {
+  execute(
+    `INSERT INTO settings (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    [key, value]
+  );
+  return value;
+}
+
+// V18：清理旧消息 + VACUUM 回收空间
+function cleanupOldMessages(daysThreshold = 30) {
+  const cutoff = Date.now() - daysThreshold * 24 * 60 * 60 * 1000;
+  execute('DELETE FROM files WHERE message_id IN (SELECT message_id FROM messages WHERE timestamp < ?)', [cutoff]);
+  execute('DELETE FROM messages WHERE timestamp < ?', [cutoff]);
+  execute("DELETE FROM sessions WHERE status = 'ended' AND session_id NOT IN (SELECT DISTINCT session_id FROM messages)");
+  if (db) db.run('VACUUM;');
+  persist();
+  return { deleted: true, cutoff };
+}
+
+module.exports = {
+  initDatabase,
+  query,
+  queryOne,
+  execute,
+  getClientInfo,
+  setNickname,
+  upsertContact,
+  listContacts,
+  setAlias,
+  toggleFavorite,
+  listSessions,
+  touchSession,
+  getSession,
+  createSession,
+  closeSession,
+  leaveSession,
+  deleteSession,
+  listMessages,
+  addMessage,
+  addFile,
+  updateFileStatus,
+  listFiles,
+  getSetting,
+  setSetting,
+  persistNow,
+  cleanupOldMessages
+};

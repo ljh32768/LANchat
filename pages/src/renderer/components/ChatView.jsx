@@ -25,6 +25,7 @@ export default function ChatView() {
     activeSessionId ? (s.messagesBySession[activeSessionId] || EMPTY_MESSAGES) : EMPTY_MESSAGES
   );
   const clientId = useClientStore((s) => s.clientId);
+  const selfIp = useClientStore((s) => s.ip);
   const contacts = useContactsStore((s) => s.contacts);
   const peers = useContactsStore((s) => s.peers);
   const scrollRef = useRef(null);
@@ -67,7 +68,8 @@ export default function ChatView() {
   const isHost = session.host_contact_id === clientId;
   const ended = session.status === SESSION_STATUS.ENDED;
   const hostInfo = discovered.find((d) => d.session_id === session.session_id);
-  const hostIp = hostInfo?.host_ip;
+  // 主机不在自己的 discovered 列表中，下载文件时回退使用本机 IP
+  const hostIp = hostInfo?.host_ip || (isHost ? selfIp : undefined);
 
   // V14：虚拟列表行渲染器
   const renderRow = ({ index, style }) => {
@@ -80,7 +82,6 @@ export default function ChatView() {
           clientId={clientId}
           contacts={contacts}
           peers={peers}
-          isHost={isHost}
           hostIp={hostIp}
           filePort={FILE_PORT}
           ended={ended}

@@ -60,6 +60,7 @@ const IPC = {
   // 文件
   FILE_UPLOAD: 'file:upload',
   FILE_DOWNLOAD: 'file:download',
+  FILE_RESUME: 'file:resume',
   FILE_LIST: 'file:list',
   // 网络 / 发现
   NETWORK_GET_DISCOVERED: 'network:get-discovered',

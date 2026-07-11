@@ -1,11 +1,14 @@
 node_modules/
 dist/
+dist-build/
+dist-out/
+release/
 data/
 *.log
 .DS_Store
 .ebcache/
-dist-build/
-dist-out/
-release/
+.trae/
 .build-log.txt
+.build-status.txt
 .defender-check.txt
+.run-build.cmd

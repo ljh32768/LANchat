@@ -34,28 +34,62 @@ export function useIpcEvents() {
         }
       })
     );
+    // V17：消息接收批处理（使用 RAF 聚合更新，避免频繁 React 重渲染）
+    let pendingMessages = [];
+    let pendingSessionCounts = new Map();
+    let rafScheduled = false;
+    const flushUpdates = () => {
+      rafScheduled = false;
+
+      // 批量处理消息
+      if (pendingMessages.length > 0) {
+        const messageStore = useMessagesStore.getState();
+        const sessionStore = useSessionsStore.getState();
+        const sessions = sessionStore.sessions;
+        const soundOn = useSettingsStore.getState().soundEnabled;
+
+        // 批量添加消息（减少单次操作数）
+        for (const msg of pendingMessages) {
+          messageStore.addReceived(msg);
+          sessionStore.incrementUnread(msg.session_id);
+
+          // 查找会话类型以差异化反馈
+          const session = sessions.find((s) => s.session_id === msg.session_id);
+          const isPrivate = session?.type === 'private';
+
+          if (isPrivate) {
+            // 私聊：强反馈（脉冲 + 音效 + 闪烁）
+            if (soundOn && !document.hasFocus()) playMessageSound();
+            if (!document.hasFocus()) {
+              window.api.invoke('window:flash').catch(() => {});
+            }
+            document.body.classList.add('pulse-border');
+            setTimeout(() => document.body.classList.remove('pulse-border'), 1200);
+          }
+          // 群聊：仅未读指示器呼吸灯（incrementUnread 已处理，CSS .sb-unread 自带呼吸动画）
+        }
+        pendingMessages = [];
+      }
+
+      // 批量更新未读计数
+      if (pendingSessionCounts.size > 0) {
+        const sessionStore = useSessionsStore.getState();
+        for (const [sid, count] of pendingSessionCounts.entries()) {
+          sessionStore.incrementUnread(sid);
+        }
+        pendingSessionCounts.clear();
+      }
+    };
+
     unsubs.push(
       window.api.on('message:received', (msg) => {
-        useMessagesStore.getState().addReceived(msg);
-        // 未读计数（私聊群聊均计）
-        useSessionsStore.getState().incrementUnread(msg.session_id);
+        pendingMessages.push(msg);
+        pendingSessionCounts.set(msg.session_id, (pendingSessionCounts.get(msg.session_id) || 0) + 1);
 
-        // 查找会话类型以差异化反馈
-        const sessions = useSessionsStore.getState().sessions;
-        const session = sessions.find((s) => s.session_id === msg.session_id);
-        const isPrivate = session?.type === 'private';
-
-        if (isPrivate) {
-          // 私聊：强反馈（脉冲 + 音效 + 闪烁）
-          const soundOn = useSettingsStore.getState().soundEnabled;
-          if (soundOn && !document.hasFocus()) playMessageSound();
-          if (!document.hasFocus()) {
-            window.api.invoke('window:flash').catch(() => {});
-          }
-          document.body.classList.add('pulse-border');
-          setTimeout(() => document.body.classList.remove('pulse-border'), 1200);
+        if (!rafScheduled) {
+          rafScheduled = true;
+          requestAnimationFrame(flushUpdates);
         }
-        // 群聊：仅未读指示器呼吸灯（incrementUnread 已处理，CSS .sb-unread 自带呼吸动画）
       })
     );
     // V15：文件下载进度用 rAF 节流，避免每个 TCP 块都触发 React 重渲染
@@ -97,15 +131,11 @@ export function useIpcEvents() {
       })
     );
 
-    // 定期刷新发现的会话/在线用户
-    const refreshTimer = setInterval(async () => {
-      const data = await window.api.invoke('network:get-discovered');
-      data.sessions.forEach((s) => useSessionsStore.getState().addDiscovered(s));
-    }, 4000);
+    // V16：事件驱动的会话发现（移除 4 秒轮询，改用事件驱动）
+    // 主进程在会话被发现/移除时会发送相应事件，无需轮询
 
     return () => {
       unsubs.forEach((u) => u && u());
-      clearInterval(refreshTimer);
     };
   }, []);
 }

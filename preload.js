@@ -6,7 +6,7 @@ const invokeChannels = new Set([
   'contacts:list', 'contacts:set-alias', 'contacts:toggle-favorite',
   'session:create', 'session:close', 'session:leave', 'session:delete', 'session:list', 'session:join',
   'message:send', 'message:list',
-  'file:upload', 'file:download', 'file:list',
+  'file:upload', 'file:download', 'file:resume', 'file:list',
   'network:get-discovered',
   'settings:get', 'settings:set',
   'window:close', 'window:minimize', 'window:maximize', 'window:flash',

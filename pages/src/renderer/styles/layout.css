@@ -228,7 +228,7 @@
 .file-name { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-size { font-size: 11px; color: var(--text-dim); font-family: var(--font-mono); }
 .file-progress { position: relative; height: 6px; background: rgba(0,229,255,0.1); border-radius: 3px; margin-top: 6px; overflow: hidden; }
-.file-progress-bar { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, var(--neon-blue), var(--neon-cyan)); box-shadow: 0 0 8px rgba(0,229,255,0.6); transition: width 0.2s; }
+.file-progress-bar { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, var(--neon-blue), var(--neon-cyan)); box-shadow: 0 0 8px rgba(0,229,255,0.6); }
 .file-progress span { position: absolute; right: 0; top: -16px; font-size: 10px; color: var(--neon-cyan); font-family: var(--font-mono); }
 .file-failed { font-size: 11px; color: var(--neon-pink); margin-top: 4px; }
 .file-action { flex-shrink: 0; }

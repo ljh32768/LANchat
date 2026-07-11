@@ -2,6 +2,7 @@
 // sql.js 为内存数据库，每次写入后持久化到 chat.db 文件。
 const path = require('path');
 const fs = require('fs');
+const { Worker } = require('worker_threads');
 const { app } = require('electron');
 const initSqlJs = require('sql.js');
 const { SCHEMA_SQL } = require('./schema');
@@ -12,8 +13,31 @@ let db = null;
 let dbPath = null;
 let persistTimer = null;
 let pendingPersist = false;
+let persistWorker = null;
+
+// 初始化持久化 worker：承接同步写盘，避免阻塞主线程事件循环
+// worker 不可用时（打包路径问题等）自动 fallback 到同步写
+function initPersistWorker() {
+  if (persistWorker) return;
+  try {
+    const workerPath = path.join(__dirname, 'persist-worker.js');
+    persistWorker = new Worker(workerPath);
+    persistWorker.on('error', (e) => {
+      console.error('[db] persist worker error:', e);
+      persistWorker = null;
+    });
+    persistWorker.on('exit', (code) => {
+      if (code !== 0) { console.warn('[db] persist worker exit code', code); persistWorker = null; }
+    });
+    console.log('[db] persist worker initialized');
+  } catch (e) {
+    console.warn('[db] persist worker init failed, fallback to sync:', e.message);
+    persistWorker = null;
+  }
+}
 
 // 把当前内存数据库写入磁盘（防抖 500ms + 原子写入 write-to-temp-then-rename）
+// 写盘移到 worker_threads，主线程只做 db.export()（WASM 同步，通常 <50ms）
 function persist() {
   if (!db) return;
   // V6：防抖 —— 500ms 内多次写入只持久化一次，避免每条消息都全量 export
@@ -27,8 +51,14 @@ function persist() {
       const data = db.export();
       // V12：原子写入 —— 先写临时文件再 rename，防崩溃损坏 DB
       const tmp = dbPath + '.tmp';
-      fs.writeFileSync(tmp, Buffer.from(data));
-      fs.renameSync(tmp, dbPath);
+      if (persistWorker) {
+        // transfer buffer 零拷贝给 worker，写盘不阻塞主线程
+        persistWorker.postMessage({ buffer: data.buffer, tmpPath: tmp, dbPath }, [data.buffer]);
+      } else {
+        // fallback：同步写（worker 不可用时）
+        fs.writeFileSync(tmp, Buffer.from(data));
+        fs.renameSync(tmp, dbPath);
+      }
     } catch (e) {
       console.error('[db] persist failed:', e);
     }
@@ -43,8 +73,12 @@ function persistNow() {
   try {
     const data = db.export();
     const tmp = dbPath + '.tmp';
-    fs.writeFileSync(tmp, Buffer.from(data));
-    fs.renameSync(tmp, dbPath);
+    if (persistWorker) {
+      persistWorker.postMessage({ buffer: data.buffer, tmpPath: tmp, dbPath }, [data.buffer]);
+    } else {
+      fs.writeFileSync(tmp, Buffer.from(data));
+      fs.renameSync(tmp, dbPath);
+    }
   } catch (e) {
     console.error('[db] persistNow failed:', e);
   }
@@ -69,7 +103,38 @@ function runMigrations() {
     version = 1;
   }
 
-  // 未来迁移在此追加：if (version < 2) { ... version = 2; }
+  // v2: 添加 files.received_bytes 列（断点续传：记录已接收字节数）
+  if (version < 2) {
+    try {
+      const cols = query('PRAGMA table_info(files)');
+      if (cols.length > 0 && !cols.some((c) => c.name === 'received_bytes')) {
+        execute('ALTER TABLE files ADD COLUMN received_bytes INTEGER DEFAULT 0');
+      }
+    } catch (e) {
+      console.error('[db] migration v2 failed:', e);
+    }
+    version = 2;
+  }
+
+  // v3: 建 file_parts 表（多连接并行下载：每 part 独立追踪 received_bytes 支持续传）
+  if (version < 3) {
+    try {
+      execute(`CREATE TABLE IF NOT EXISTS file_parts (
+        file_id        TEXT,
+        part_id        INTEGER,
+        offset         INTEGER,
+        length         INTEGER,
+        received_bytes INTEGER DEFAULT 0,
+        status         TEXT,
+        PRIMARY KEY (file_id, part_id)
+      )`);
+    } catch (e) {
+      console.error('[db] migration v3 failed:', e);
+    }
+    version = 3;
+  }
+
+  // 未来迁移在此追加：if (version < 4) { ... version = 4; }
 
   if (db) db.run(`PRAGMA user_version = ${version};`);
   console.log('[db] migrations done, user_version =', version);
@@ -118,6 +183,9 @@ async function initDatabase() {
 
   // V28：版本化数据库迁移（PRAGMA user_version）
   runMigrations();
+
+  // 初始化持久化 worker（承接写盘，不阻塞主线程）
+  initPersistWorker();
 
   persist();
 
@@ -299,8 +367,46 @@ function updateFileStatus(file_id, status, storage_path = null) {
   }
 }
 
+// 断点续传：记录已接收字节数（可选附带 storage_path，用于失败后保留分片路径）
+function updateFileProgress(file_id, received_bytes, storage_path = null) {
+  if (storage_path !== null) {
+    execute('UPDATE files SET received_bytes = ?, storage_path = ? WHERE file_id = ?', [
+      received_bytes,
+      storage_path,
+      file_id
+    ]);
+  } else {
+    execute('UPDATE files SET received_bytes = ? WHERE file_id = ?', [received_bytes, file_id]);
+  }
+}
+
+function getFile(file_id) {
+  return queryOne('SELECT * FROM files WHERE file_id = ?', [file_id]);
+}
+
 function listFiles(message_id) {
   return query('SELECT * FROM files WHERE message_id = ?', [message_id]);
+}
+
+// 多连接并行下载：file_parts 表操作
+function setFileParts(file_id, parts) {
+  execute('DELETE FROM file_parts WHERE file_id = ?', [file_id]);
+  for (const p of parts) {
+    execute('INSERT INTO file_parts (file_id, part_id, offset, length, received_bytes, status) VALUES (?,?,?,?,?,?)',
+      [file_id, p.part_id, p.offset, p.length, p.received_bytes || 0, p.status || 'pending']);
+  }
+}
+
+function updateFilePartProgress(file_id, part_id, received_bytes) {
+  execute('UPDATE file_parts SET received_bytes = ? WHERE file_id = ? AND part_id = ?', [received_bytes, file_id, part_id]);
+}
+
+function listFileParts(file_id) {
+  return query('SELECT * FROM file_parts WHERE file_id = ? ORDER BY part_id', [file_id]);
+}
+
+function clearFileParts(file_id) {
+  execute('DELETE FROM file_parts WHERE file_id = ?', [file_id]);
 }
 
 function getSetting(key, defaultValue = null) {
@@ -350,7 +456,13 @@ module.exports = {
   addMessage,
   addFile,
   updateFileStatus,
+  updateFileProgress,
+  getFile,
   listFiles,
+  setFileParts,
+  updateFilePartProgress,
+  listFileParts,
+  clearFileParts,
   getSetting,
   setSetting,
   persistNow,

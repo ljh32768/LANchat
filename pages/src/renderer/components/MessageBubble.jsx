@@ -14,8 +14,9 @@ function formatSize(bytes) {
   return (bytes / 1024 / 1024).toFixed(2) + ' MB';
 }
 
-export default function MessageBubble({ message, isSelf, clientId, contacts, peers, isHost, hostIp, filePort, ended }) {
+export default function MessageBubble({ message, isSelf, clientId, contacts, peers, hostIp, filePort, ended }) {
   const download = useFilesStore((s) => s.download);
+  const resume = useFilesStore((s) => s.resume);
 
   // 身份解析（仅对收到的消息需要复杂显示）
   const identity = isSelf
@@ -47,9 +48,9 @@ export default function MessageBubble({ message, isSelf, clientId, contacts, pee
           <FileCard
             meta={fileMeta}
             isSelf={isSelf}
-            isHost={isHost}
             ended={ended}
             onDownload={() => fileMeta.file_id && hostIp && download(fileMeta.file_id, hostIp, filePort)}
+            onResume={() => fileMeta.file_id && hostIp && resume(fileMeta.file_id, hostIp, filePort)}
           />
         ) : (
           <div className="msg-text">{message.content}</div>
@@ -60,9 +61,10 @@ export default function MessageBubble({ message, isSelf, clientId, contacts, pee
   );
 }
 
-function FileCard({ meta, isSelf, isHost, ended, onDownload }) {
+function FileCard({ meta, isSelf, ended, onDownload, onResume }) {
   const progress = useFilesStore((s) => s.progress[meta.file_id] ?? null);
-  const status = useFilesStore((s) => s.status[meta.file_id] ?? (isSelf || isHost ? 'completed' : 'pending'));
+  // 仅发送方（isSelf）本机拥有原文件 → completed；主机作为接收方仍需下载
+  const status = useFilesStore((s) => s.status[meta.file_id] ?? (isSelf ? 'completed' : 'pending'));
 
   return (
     <div className="file-card">
@@ -79,12 +81,14 @@ function FileCard({ meta, isSelf, isHost, ended, onDownload }) {
         {status === 'failed' && <div className="file-failed">下载失败</div>}
       </div>
       <div className="file-action">
-        {(isSelf || isHost) ? (
+        {isSelf ? (
           <span className="file-done">已暂存</span>
         ) : status === 'completed' ? (
           <span className="file-done">已下载</span>
         ) : status === 'downloading' ? (
           <span className="file-busy">传输中</span>
+        ) : status === 'failed' ? (
+          <button className="file-dl-btn" onClick={onResume}>续传</button>
         ) : ended ? (
           <span className="file-unavail">不可用</span>
         ) : (

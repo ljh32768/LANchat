@@ -101,6 +101,31 @@ class NetworkManager extends EventEmitter {
     this.fileServer = null;
     this.fileServerPort = TCP_FILE_PORT_BASE;
     this.fileStoreDir = null; // 延迟到 start() 内初始化（需 app.whenReady 后）
+
+    // 文件传输并发控制：限制同时进行的传输数，防多文件并行时磁盘竞争
+    this._activeFileTransfers = 0;
+    this._maxFileTransfers = 4;
+    this._fileTransferQueue = [];
+  }
+
+  // 入队文件传输；未达上限则立即启动，否则排队等待空位
+  _enqueueFileTransfer(startFn) {
+    if (this._activeFileTransfers < this._maxFileTransfers) {
+      this._activeFileTransfers++;
+      startFn();
+    } else {
+      this._fileTransferQueue.push(startFn);
+    }
+  }
+
+  // 完成一次传输：释放一个空位并按 FIFO 启动下一个排队任务
+  _finishFileTransfer() {
+    this._activeFileTransfers--;
+    if (this._activeFileTransfers < this._maxFileTransfers && this._fileTransferQueue.length > 0) {
+      this._activeFileTransfers++;
+      const next = this._fileTransferQueue.shift();
+      next();
+    }
   }
 
   // ---- 启动 ----
@@ -356,12 +381,15 @@ class NetworkManager extends EventEmitter {
       if (ctx.ended) continue;
       const tcpAlive = ctx.socket && !ctx.socket.destroyed && ctx.socket.writable;
       if (tcpAlive) continue; // TCP 还在 → 保留（可能在重连中，也可能是正常连接）
-      // TCP 已断 → 看 UDP peers 里主机是否还在线
+      // 正在重连中（reconnectAttempts > 0）→ 交给重连逻辑自行处理放弃，sweep 不干预
+      // 否则重连等待窗口内 UDP 短暂丢包会误删会话，导致"会话已结束"假象
+      if (ctx.reconnectAttempts > 0) continue;
+      // TCP 已断 且 未在重连 → 看 UDP peers 里主机是否还在线
       const hostStillOnline = Array.from(this.peers.values()).some((p) => p.ip === ctx.host_ip);
       if (!hostStillOnline) {
         console.warn('[net] sweep: host offline and tcp dead, remove joined session', sid.slice(0, 8), 'host_ip', ctx.host_ip);
         this._stopHeartbeat(sid);
-        try { ctx.socket.destroy(); } catch {}
+        try { ctx.socket.removeAllListeners(); ctx.socket.destroy(); } catch {}
         this.joined.delete(sid);
         this.emit('session-removed', { session_id: sid });
       }
@@ -613,10 +641,12 @@ class NetworkManager extends EventEmitter {
     });
     socket.on('error', (e) => {
       console.error('[net] joinSession error:', hostIp + ':' + hostPort, e.code, e.message);
-      // 不立即 emit session-removed，交给 end 处理（重连或结束）
+      // close 会统一处理重连（error 后 close 必触发）
     });
-    socket.on('end', () => {
-      console.log('[net] joinSession ended:', hostIp + ':' + hostPort, 'ended flag=', ctx.ended);
+    // 用 close 替代 end：close 在正常 FIN / error / destroy() 后都会触发，
+    // 而 end 只在对端发 FIN 时触发——error 或心跳 destroy 时不触发 end，导致重连丢失
+    socket.on('close', () => {
+      console.log('[net] joinSession closed:', hostIp + ':' + hostPort, 'ended flag=', ctx.ended);
       this._stopHeartbeat(sessionId);
       if (ctx.ended) return; // 主机解散，已处理
       // 网络抖动：自动重连
@@ -660,6 +690,8 @@ class NetworkManager extends EventEmitter {
     if (!ctx || ctx.ended) return;
     if (ctx.reconnectAttempts >= 5) {
       console.error('[net] reconnect give up after 5 attempts', sessionId.slice(0, 8));
+      ctx.ended = true;
+      try { ctx.socket.removeAllListeners(); ctx.socket.destroy(); } catch {}
       this.joined.delete(sessionId);
       this.emit('session-removed', { session_id: sessionId });
       return;
@@ -669,7 +701,8 @@ class NetworkManager extends EventEmitter {
     console.log('[net] reconnect in', delay, 'ms attempt', ctx.reconnectAttempts, sessionId.slice(0, 8));
     setTimeout(() => {
       if (ctx.ended || !this.joined.has(sessionId)) return;
-      try { ctx.socket.destroy(); } catch {}
+      // 先移除监听器再 destroy，避免 close 事件递归触发 _reconnectJoined
+      try { ctx.socket.removeAllListeners(); ctx.socket.destroy(); } catch {}
       console.log('[net] reconnecting to', ctx.host_ip + ':' + ctx.host_port, sessionId.slice(0, 8));
       const socket = net.createConnection({ host: ctx.host_ip, port: ctx.host_port });
       ctx.socket = socket;
@@ -717,8 +750,8 @@ class NetworkManager extends EventEmitter {
       socket.on('error', (e) => {
         console.error('[net] reconnect error:', ctx.host_ip + ':' + ctx.host_port, e.code, e.message);
       });
-      socket.on('end', () => {
-        console.log('[net] reconnect ended again, retry', sessionId.slice(0, 8));
+      socket.on('close', () => {
+        console.log('[net] reconnect closed, retry', sessionId.slice(0, 8));
         this._stopHeartbeat(sessionId);
         if (ctx.ended) return;
         this._reconnectJoined(sessionId);
@@ -735,8 +768,9 @@ class NetworkManager extends EventEmitter {
   leaveSession(sessionId) {
     const ctx = this.joined.get(sessionId);
     if (ctx) {
+      ctx.ended = true; // 阻止 close 处理器触发重连
       this._stopHeartbeat(sessionId);
-      try { ctx.socket.destroy(); } catch {}
+      try { ctx.socket.removeAllListeners(); ctx.socket.destroy(); } catch {}
       this.joined.delete(sessionId);
     }
   }
@@ -800,19 +834,22 @@ class NetworkManager extends EventEmitter {
     });
   }
 
+  // 文件传输 socket 调优：禁用 Nagle、开启 keepAlive、调大收发缓冲区以充分利用局域网带宽
+  _tuneFileSocket(socket) {
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 30000);
+    socket.setTimeout(120000);
+    try {
+      socket.setSendBufferSize(1024 * 1024);
+      socket.setRecvBufferSize(1024 * 1024);
+    } catch (e) { /* 部分平台可能忽略，静默降级 */ }
+  }
+
   _onFileSocket(socket) {
-    const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, remaining: 0, header: null, timeoutTimer: null };
-    // 文件传输超时清理（2 分钟无活动则关闭，防 socket/文件句柄泄漏）
-    state.timeoutTimer = setTimeout(() => {
-      console.warn('[net] file socket timeout, destroy');
-      if (state.ws) state.ws.destroy();
-      socket.destroy();
-    }, 120000);
-    const refreshTimeout = () => {
-      if (state.timeoutTimer) state.timeoutTimer.refresh();
-    };
+    this._tuneFileSocket(socket);
+    const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, remaining: 0, header: null };
+    // 超时由 socket.setTimeout（_tuneFileSocket 内设置）驱动，按非活动自动重置
     socket.on('data', (chunk) => {
-      refreshTimeout();
       if (state.phase === 'header') {
         state.buf = Buffer.concat([state.buf, chunk]);
         const idx = state.buf.indexOf(0x0a); // '\n'
@@ -827,11 +864,12 @@ class NetworkManager extends EventEmitter {
         if (header.kind === 'download') {
           const filePath = this._safeFilePath(header.file_id);
           if (!filePath) { console.warn('[net] reject unsafe file_id', header.file_id); socket.destroy(); return; }
-          this._serveFileDownload(socket, filePath, header.file_id);
+          this._serveFileDownload(socket, filePath, header.file_id, header.offset || 0, header.length || 0);
         } else if (header.kind === 'upload') {
           const dest = this._safeFilePath(header.file_id);
           if (!dest) { console.warn('[net] reject unsafe file_id', header.file_id); socket.destroy(); return; }
-          state.ws = fs.createWriteStream(dest);
+          state.ws = fs.createWriteStream(dest, { highWaterMark: 512 * 1024 });
+          state.ws.on('drain', () => socket.resume()); // 写盘就绪后恢复接收
           state.remaining = header.file_size;
           state.phase = 'body';
           if (rest.length) this._consumeUploadBody(state, rest, socket);
@@ -840,15 +878,14 @@ class NetworkManager extends EventEmitter {
         this._consumeUploadBody(state, chunk, socket);
       }
     });
+    socket.on('timeout', () => { console.warn('[net] file socket timeout, destroy'); if (state.ws) state.ws.destroy(); socket.destroy(); });
     socket.on('error', () => { if (state.ws) state.ws.destroy(); });
-    socket.on('end', () => { if (state.timeoutTimer) clearTimeout(state.timeoutTimer); });
-    socket.on('close', () => { if (state.timeoutTimer) clearTimeout(state.timeoutTimer); });
   }
 
   _consumeUploadBody(state, chunk, socket) {
     if (state.remaining <= 0) return;
     const toWrite = chunk.slice(0, state.remaining);
-    state.ws.write(toWrite);
+    const ok = state.ws.write(toWrite);
     state.remaining -= toWrite.length;
     if (state.remaining <= 0) {
       state.ws.end();
@@ -856,20 +893,30 @@ class NetworkManager extends EventEmitter {
       this._sendJson(socket, { kind: 'upload-done', file_id: state.header.file_id });
       socket.end();
       this.emit('file-uploaded', { file_id: state.header.file_id, file_name: state.header.file_name });
+    } else if (!ok) {
+      socket.pause(); // 写盘跟不上则暂停接收，drain 后由 resume 恢复
     }
   }
 
-  _serveFileDownload(socket, filePath, fileId) {
+  _serveFileDownload(socket, filePath, fileId, offset = 0, length = 0) {
     if (!fs.existsSync(filePath)) {
       this._sendJson(socket, { kind: 'download-error', file_id: fileId });
       socket.end();
       return;
     }
     const stat = fs.statSync(filePath);
-    socket.write(Buffer.from(JSON.stringify({ kind: 'download-start', file_id: fileId, size: stat.size }) + '\n', 'utf8'));
-    const stream = fs.createReadStream(filePath);
-    stream.on('data', (d) => socket.write(d));
-    stream.on('end', () => socket.end());
+    // 计算字节范围 [offset, end]；length=0 表示读到 EOF（兼容旧客户端单连接下载）
+    const end = length > 0 ? offset + length - 1 : stat.size - 1;
+    if (offset < 0 || offset >= stat.size || end >= stat.size || end < offset) {
+      this._sendJson(socket, { kind: 'download-error', file_id: fileId, reason: 'invalid range' });
+      socket.end();
+      return;
+    }
+    const actualLength = end - offset + 1;
+    socket.write(Buffer.from(JSON.stringify({ kind: 'download-start', file_id: fileId, size: stat.size, offset, length: actualLength }) + '\n', 'utf8'));
+    // 从 offset 到 end 读取；pipe 自动处理背压
+    const stream = fs.createReadStream(filePath, { start: offset, end, highWaterMark: 512 * 1024 });
+    stream.pipe(socket);
     stream.on('error', () => socket.destroy());
   }
 
@@ -877,61 +924,190 @@ class NetworkManager extends EventEmitter {
   uploadFileToHost(sessionId, { file_id, file_name, file_size, file_path }, cb) {
     const ctx = this.joined.get(sessionId);
     if (!ctx) { cb(new Error('not joined')); return; }
-    const sock = net.createConnection({ host: ctx.host_ip, port: this.fileServerPort });
-    let timeoutTimer = setTimeout(() => { sock.destroy(); cb(new Error('upload timeout')); }, 120000);
-    sock.on('connect', () => {
-      sock.write(Buffer.from(JSON.stringify({
-        kind: 'upload', file_id, file_name, file_size, session_id: sessionId
-      }) + '\n', 'utf8'));
-      const stream = fs.createReadStream(file_path);
-      stream.on('data', (d) => { sock.write(d); timeoutTimer.refresh(); });
-      stream.on('end', () => sock.end());
-      stream.on('error', (e) => { clearTimeout(timeoutTimer); sock.destroy(); cb(e); });
+    this._enqueueFileTransfer(() => {
+      const sock = net.createConnection({ host: ctx.host_ip, port: this.fileServerPort });
+      this._tuneFileSocket(sock);
+      let called = false;
+      const done = (err) => { if (called) return; called = true; this._finishFileTransfer(); cb(err); };
+      sock.on('connect', () => {
+        sock.write(Buffer.from(JSON.stringify({
+          kind: 'upload', file_id, file_name, file_size, session_id: sessionId
+        }) + '\n', 'utf8'));
+        // pipe 自动处理背压；超时由 socket.setTimeout 按非活动自动重置
+        const stream = fs.createReadStream(file_path, { highWaterMark: 512 * 1024 });
+        stream.pipe(sock);
+        stream.on('error', (e) => { sock.destroy(); done(e); });
+      });
+      // 必须有 data 监听器保持 socket 流动模式：否则 upload-done 响应滞留内部缓冲，
+      // end 事件不触发，客户端挂起至超时
+      sock.on('data', () => {});
+      sock.on('end', () => done(null)); // 收到 upload-done 且对端关闭
+      sock.on('error', (e) => done(e));
+      sock.on('timeout', () => { sock.destroy(); done(new Error('upload timeout')); });
     });
-    sock.on('data', () => { timeoutTimer.refresh(); }); // 等待 upload-done
-    sock.on('end', () => { clearTimeout(timeoutTimer); cb(null); });
-    sock.on('error', (e) => { clearTimeout(timeoutTimer); sock.destroy(); cb(e); });
   }
 
-  // 下载主机上的文件
-  downloadFile(hostIp, hostPort, fileId, destPath, onProgress, onDone) {
-    const sock = net.createConnection({ host: hostIp, port: this.fileServerPort });
-    const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, size: 0, total: 0 };
-    let timeoutTimer = setTimeout(() => { if (state.ws) state.ws.destroy(); sock.destroy(); onDone(new Error('download timeout')); }, 120000);
-    sock.on('connect', () => {
-      sock.write(Buffer.from(JSON.stringify({ kind: 'download', file_id: fileId }) + '\n', 'utf8'));
-    });
-    sock.on('data', (chunk) => {
-      timeoutTimer.refresh();
-      if (state.phase === 'header') {
-        state.buf = Buffer.concat([state.buf, chunk]);
-        const idx = state.buf.indexOf(0x0a);
-        if (idx === -1) return;
-        const header = JSON.parse(state.buf.slice(0, idx).toString('utf8'));
-        const rest = state.buf.slice(idx + 1);
-        state.buf = Buffer.alloc(0);
-        if (header.kind !== 'download-start') {
-          clearTimeout(timeoutTimer);
-          onDone(new Error('download error: ' + (header.kind || 'unknown')));
-          sock.destroy();
-          return;
+  // 下载主机上的文件；offset > 0 时断点续传（追加写）
+  downloadFile(hostIp, hostPort, fileId, destPath, offset, onProgress, onDone) {
+    this._enqueueFileTransfer(() => {
+      const sock = net.createConnection({ host: hostIp, port: hostPort || this.fileServerPort });
+      this._tuneFileSocket(sock);
+      // offset>0：以 r+ 在指定位置写入（不截断，文件须存在且大小>=offset）；offset=0：默认 w 截断新建
+      const wsOpts = offset > 0
+        ? { flags: 'r+', start: offset, highWaterMark: 512 * 1024 }
+        : { highWaterMark: 512 * 1024 };
+      const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, size: 0, total: offset };
+      let called = false;
+      const done = (err, p) => { if (called) return; called = true; this._finishFileTransfer(); onDone(err, p); };
+      sock.on('connect', () => {
+        sock.write(Buffer.from(JSON.stringify({ kind: 'download', file_id: fileId, offset }) + '\n', 'utf8'));
+      });
+      sock.on('data', (chunk) => {
+        if (state.phase === 'header') {
+          state.buf = Buffer.concat([state.buf, chunk]);
+          const idx = state.buf.indexOf(0x0a);
+          if (idx === -1) return;
+          const header = JSON.parse(state.buf.slice(0, idx).toString('utf8'));
+          const rest = state.buf.slice(idx + 1);
+          state.buf = Buffer.alloc(0);
+          if (header.kind !== 'download-start') {
+            done(new Error('download error: ' + (header.kind || 'unknown')));
+            sock.destroy();
+            return;
+          }
+          // 服务端 offset 与请求不一致则中止，避免错位写入
+          if ((header.offset || 0) !== offset) {
+            done(new Error('offset mismatch'));
+            sock.destroy();
+            return;
+          }
+          state.size = header.size;
+          state.ws = fs.createWriteStream(destPath, wsOpts);
+          state.ws.on('drain', () => sock.resume()); // 写盘就绪后恢复接收
+          state.ws.on('error', (e) => { sock.destroy(); done(e); });
+          state.phase = 'body';
+          if (rest.length) {
+            const ok = state.ws.write(rest);
+            state.total += rest.length;
+            if (state.size > 0) onProgress(state.total / state.size, state.total);
+            if (!ok) sock.pause();
+          } else if (state.size > 0) {
+            onProgress(state.total / state.size, state.total);
+          }
+        } else {
+          const ok = state.ws.write(chunk);
+          state.total += chunk.length;
+          if (state.size > 0) onProgress(state.total / state.size, state.total);
+          if (!ok) sock.pause(); // 写盘跟不上则暂停接收，drain 后恢复
         }
-        state.size = header.size;
-        state.ws = fs.createWriteStream(destPath);
-        state.phase = 'body';
-        if (rest.length) { state.ws.write(rest); state.total += rest.length; }
-        if (state.size > 0) onProgress(state.total / state.size);
-      } else {
-        state.ws.write(chunk);
-        state.total += chunk.length;
-        if (state.size > 0) onProgress(state.total / state.size);
+      });
+      sock.on('end', () => {
+        if (state.ws) state.ws.end(() => done(null, destPath)); else done(new Error('connection closed'));
+      });
+      sock.on('error', (e) => { if (state.ws) state.ws.destroy(); done(e); });
+      sock.on('timeout', () => { if (state.ws) state.ws.destroy(); sock.destroy(); done(new Error('download timeout')); });
+    });
+  }
+
+  // 多连接并行下载：把文件拆 N 份，每份独立 socket + WriteStream 写同一文件不同位置
+  // partRanges: [{ part_id, offset, length, received }]  received>0 表示续传已接收字节
+  downloadFileParallel(hostIp, hostPort, fileId, fileSize, destPath, partRanges, onPartProgress, onAllDone) {
+    const N = partRanges.length;
+    if (N === 0) { onAllDone(null, destPath, []); return; }
+
+    // 预分配文件到全尺寸（首次下载或续传文件不足时）
+    try {
+      const stat = fs.statSync(destPath);
+      if (stat.size !== fileSize) fs.truncateSync(destPath, fileSize);
+    } catch {
+      // 文件不存在：创建并截断到全尺寸
+      const fd = fs.openSync(destPath, 'w');
+      fs.ftruncateSync(fd, fileSize);
+      fs.closeSync(fd);
+    }
+
+    let active = N;
+    let firstError = null;
+    const partState = partRanges.map((r) => ({ part_id: r.part_id, received: r.received || 0, done: false, err: null }));
+    // 单文件内部并行：直接占用 N 个并发槽位（绕过 _enqueueFileTransfer 队列）
+    this._activeFileTransfers += N;
+
+    const finishOne = (idx, err) => {
+      if (partState[idx].done) return;
+      partState[idx].done = true;
+      partState[idx].err = err;
+      if (err && !firstError) firstError = err;
+      active--;
+      if (active === 0) {
+        this._activeFileTransfers -= N;
+        // 拉起排队任务
+        while (this._activeFileTransfers < this._maxFileTransfers && this._fileTransferQueue.length > 0) {
+          this._activeFileTransfers++;
+          this._fileTransferQueue.shift()();
+        }
+        onAllDone(firstError, destPath, partState);
       }
+    };
+
+    partRanges.forEach((range, idx) => {
+      const alreadyReceived = range.received || 0;
+      const remainingLength = range.length - alreadyReceived;
+      // 该 part 已完成（续传场景）则直接跳过
+      if (remainingLength <= 0) { finishOne(idx, null); return; }
+
+      const sock = net.createConnection({ host: hostIp, port: hostPort || this.fileServerPort });
+      this._tuneFileSocket(sock);
+      const wsOpts = { flags: 'r+', start: range.offset + alreadyReceived, highWaterMark: 512 * 1024 };
+      const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, total: alreadyReceived, size: range.length };
+      let called = false;
+      const done = (err) => {
+        if (called) return;
+        called = true;
+        if (state.ws) state.ws.destroy();
+        sock.destroy();
+        finishOne(idx, err);
+      };
+
+      sock.on('connect', () => {
+        sock.write(Buffer.from(JSON.stringify({
+          kind: 'download',
+          file_id: fileId,
+          offset: range.offset + alreadyReceived,
+          length: remainingLength,
+          part_id: range.part_id
+        }) + '\n', 'utf8'));
+      });
+      sock.on('data', (chunk) => {
+        if (state.phase === 'header') {
+          state.buf = Buffer.concat([state.buf, chunk]);
+          const idx2 = state.buf.indexOf(0x0a);
+          if (idx2 === -1) return;
+          let header;
+          try { header = JSON.parse(state.buf.slice(0, idx2).toString('utf8')); } catch { done(new Error('bad header')); return; }
+          const rest = state.buf.slice(idx2 + 1);
+          state.buf = Buffer.alloc(0);
+          if (header.kind !== 'download-start') { done(new Error('download error: ' + (header.kind || 'unknown'))); return; }
+          state.ws = fs.createWriteStream(destPath, wsOpts);
+          state.ws.on('drain', () => sock.resume());
+          state.ws.on('error', (e) => done(e));
+          state.phase = 'body';
+          if (rest.length) {
+            const ok = state.ws.write(rest);
+            state.total += rest.length;
+            onPartProgress(range.part_id, state.total, state.size);
+            if (!ok) sock.pause();
+          }
+        } else {
+          const ok = state.ws.write(chunk);
+          state.total += chunk.length;
+          onPartProgress(range.part_id, state.total, state.size);
+          if (!ok) sock.pause();
+        }
+      });
+      sock.on('end', () => { if (state.ws) state.ws.end(() => done(null)); else done(new Error('closed')); });
+      sock.on('error', (e) => done(e));
+      sock.on('timeout', () => done(new Error('part timeout')));
     });
-    sock.on('end', () => {
-      clearTimeout(timeoutTimer);
-      if (state.ws) state.ws.end(() => onDone(null, destPath)); else onDone(new Error('connection closed'));
-    });
-    sock.on('error', (e) => { clearTimeout(timeoutTimer); if (state.ws) state.ws.destroy(); onDone(e); });
   }
 
   getFileStorePath(file_id) {

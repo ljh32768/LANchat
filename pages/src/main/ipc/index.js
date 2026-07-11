@@ -18,6 +18,94 @@ const net = new NetworkManager();
 let mainWindow = null;
 let initialized = false;
 
+// V14：消息速率限制（10 msg/sec）与消息队列
+const MAX_MSG_PER_SEC = 10;
+const MSG_QUEUE_SIZE = 100;
+const messageQueue = new Map(); // file_id -> { queue: [], lastTs, currentMsg }
+
+function enqueueMessage(session_id, content, type) {
+  const client = db.getClientInfo();
+  const message_id = uuidv4();
+  const local_id = uuidv4();
+  const timestamp = Date.now();
+  const msg = {
+    kind: 'msg',
+    message_id,
+    session_id,
+    sender_contact_id: client.client_id,
+    sender_nickname: client.nickname,
+    sender_ip: net.localIp,
+    content,
+    type,
+    timestamp,
+    local_id
+  };
+
+  const queueKey = `${session_id}:${client.client_id}`;
+  let q = messageQueue.get(queueKey);
+
+  if (!q) {
+    q = { queue: [], lastTs: timestamp, currentMsg: null };
+    messageQueue.set(queueKey, q);
+  }
+
+  // 如果有消息正在发送，直接排队等待
+  if (q.currentMsg) {
+    if (q.queue.length >= MSG_QUEUE_SIZE) {
+      // 队列已满，丢弃最早的
+      q.queue.shift();
+    }
+    q.queue.push(msg);
+    return { message_id, timestamp, local_id };
+  }
+
+  // 检查速率限制
+  const timeSinceLastMsg = timestamp - q.lastTs;
+  if (timeSinceLastMsg < 1000) {
+    // 1秒内超过 MAX_MSG_PER_SEC，排队
+    if (q.queue.length >= MSG_QUEUE_SIZE) {
+      q.queue.shift();
+    }
+    q.queue.push(msg);
+    return { message_id, timestamp, local_id };
+  }
+
+  // 速率限制通过，立即发送
+  q.lastTs = timestamp;
+  q.currentMsg = msg;
+
+  // 发送方本地存库
+  db.addMessage({
+    message_id,
+    session_id,
+    sender_contact_id: client.client_id,
+    content,
+    type,
+    timestamp,
+    local_id
+  });
+
+  // 网络发送
+  const sendMsg = () => {
+    if (net.isHosting(session_id)) {
+      net.relayToMembers(session_id, msg);
+    } else if (net.isJoined(session_id)) {
+      net.memberSend(session_id, msg);
+    }
+    q.currentMsg = null;
+
+    // 处理队列中的下一条消息
+    if (q.queue.length > 0) {
+      const nextMsg = q.queue.shift();
+      // 使用 setTimeout 允许事件循环处理其他任务
+      setTimeout(() => enqueueMessage(nextMsg.session_id, nextMsg.content, nextMsg.type), 0);
+    }
+  };
+
+  sendMsg();
+  return { message_id, timestamp, local_id };
+}
+
 // V13：昵称/名称后端校验（长度上限 + 去除换行/尖括号）
 function sanitizeName(s) {
   return String(s || '').trim().slice(0, 24).replace(/[\r\n<>]/g, '');
@@ -296,40 +384,8 @@ function registerIpcHandlers() {
   });
 
   // ---- 消息 ----
-  ipcMain.handle(IPC.MESSAGE_SEND, (_e, { session_id, content, type }) => {
-    const client = db.getClientInfo();
-    const message_id = uuidv4();
-    const local_id = uuidv4();
-    const timestamp = Date.now();
-    const msg = {
-      kind: 'msg',
-      message_id,
-      session_id,
-      sender_contact_id: client.client_id,
-      sender_nickname: client.nickname,
-      sender_ip: net.localIp,
-      content,
-      type,
-      timestamp,
-      local_id
-    };
-    // 发送方本地存库
-    db.addMessage({
-      message_id,
-      session_id,
-      sender_contact_id: client.client_id,
-      content,
-      type,
-      timestamp,
-      local_id
-    });
-    // 网络发送
-    if (net.isHosting(session_id)) {
-      net.relayToMembers(session_id, msg);
-    } else if (net.isJoined(session_id)) {
-      net.memberSend(session_id, msg);
-    }
-    return { message_id, timestamp, local_id };
+  ipcMain.handle(IPC.MESSAGE_SEND, async (_e, { session_id, content, type }) => {
+    return enqueueMessage(session_id, content, type);
   });
 
   ipcMain.handle(IPC.MESSAGE_LIST, (_e, session_id) => db.listMessages(session_id));
@@ -400,6 +456,149 @@ function registerIpcHandlers() {
     return { file_id, message_id, timestamp };
   });
 
+  // 断点续传：节流写库的已接收字节，最多每 1s 持久化一次（失败后据此续传）
+  const _progressThrottle = new Map(); // file_id -> { lastTs }
+  // V18：并行下载参数（提升并发数和降低阈值以获得更好性能）
+  // < 1.5MB 走单连接（握手开销 > 并行收益），≥ 1.5MB 走 8 路并行
+  const PARALLEL_THRESHOLD = 1.5 * 1024 * 1024;
+  const PARALLEL_PARTS = 8;
+
+  // 大文件 4 路并行下载（或续传）。ranges 为本次要传的 part 列表
+  function runDownloadParallel(file_id, host_ip, host_port, dest, fileSize, ranges, isResume) {
+    if (!isResume) {
+      db.setFileParts(file_id, ranges.map((r) => ({ ...r, status: 'downloading' })));
+    }
+    const partReceived = new Map(); // part_id -> received
+    let lastFlush = 0;
+    let lastTotal = 0;
+    const flushProgress = () => {
+      let total = 0;
+      for (const r of ranges) total += partReceived.get(r.part_id) || 0;
+      lastTotal = total;
+      const progress = total / fileSize;
+      send(IPC_EVENT.FILE_DOWNLOAD_PROGRESS, { file_id, progress });
+      const now = Date.now();
+      if (now - lastFlush > 1000) {
+        db.updateFileProgress(file_id, total);
+        for (const [pid, recv] of partReceived) db.updateFilePartProgress(file_id, pid, recv);
+        lastFlush = now;
+      }
+    };
+
+    net.downloadFileParallel(
+      host_ip, host_port, file_id, fileSize, dest, ranges,
+      (part_id, received) => {
+        partReceived.set(part_id, received);
+        flushProgress();
+      },
+      (err, finalPath, partState) => {
+        _progressThrottle.delete(file_id);
+        if (err) {
+          // 持久化各 part 进度供续传
+          for (const p of partState) db.updateFilePartProgress(file_id, p.part_id, p.received || 0);
+          db.updateFileProgress(file_id, lastTotal, dest);
+          db.updateFileStatus(file_id, FILE_STATUS.FAILED);
+          send(IPC_EVENT.FILE_DOWNLOAD_COMPLETE, { file_id, error: String(err) });
+        } else {
+          db.updateFileStatus(file_id, FILE_STATUS.COMPLETED, finalPath);
+          db.updateFileProgress(file_id, 0);
+          db.clearFileParts(file_id);
+          send(IPC_EVENT.FILE_DOWNLOAD_COMPLETE, { file_id, storage_path: finalPath });
+        }
+      }
+    );
+  }
+
+  function runDownload(file_id, host_ip, host_port, dest, offset) {
+    db.updateFileStatus(file_id, FILE_STATUS.DOWNLOADING);
+    if (offset === 0) db.updateFileProgress(file_id, 0, dest); // 新下载：记录路径 + 重置已接收
+
+    const file = db.getFile(file_id);
+    const fileSize = file ? file.file_size : 0;
+
+    // 大文件：4 路并行
+    if (fileSize >= PARALLEL_THRESHOLD && offset === 0) {
+      const partSize = Math.ceil(fileSize / PARALLEL_PARTS);
+      const ranges = [];
+      for (let i = 0; i < PARALLEL_PARTS; i++) {
+        const start = i * partSize;
+        const length = Math.min(partSize, fileSize - start);
+        if (length <= 0) break;
+        ranges.push({ part_id: i, offset: start, length, received: 0 });
+      }
+      runDownloadParallel(file_id, host_ip, host_port, dest, fileSize, ranges, false);
+      return;
+    }
+
+    // 小文件或续传：单连接
+    let lastReceived = offset;
+    net.downloadFile(host_ip, host_port, file_id, dest, offset,
+      (progress, receivedBytes) => {
+        lastReceived = receivedBytes;
+        send(IPC_EVENT.FILE_DOWNLOAD_PROGRESS, { file_id, progress });
+        const now = Date.now();
+        const entry = _progressThrottle.get(file_id);
+        if (!entry || now - entry.lastTs > 1000) {
+          db.updateFileProgress(file_id, receivedBytes);
+          _progressThrottle.set(file_id, { lastTs: now });
+        }
+      },
+      (err, finalPath) => {
+        _progressThrottle.delete(file_id);
+        if (err) {
+          // 失败：持久化最终已接收字节 + 保留 storage_path，供续传
+          db.updateFileProgress(file_id, lastReceived, dest);
+          db.updateFileStatus(file_id, FILE_STATUS.FAILED);
+          send(IPC_EVENT.FILE_DOWNLOAD_COMPLETE, { file_id, error: String(err) });
+        } else {
+          db.updateFileStatus(file_id, FILE_STATUS.COMPLETED, finalPath);
+          db.updateFileProgress(file_id, 0); // 完成：重置已接收字节
+          send(IPC_EVENT.FILE_DOWNLOAD_COMPLETE, { file_id, storage_path: finalPath });
+        }
+      }
+    );
+  }
+
+  // 主机本机下载：文件已在 fileStoreDir 中（成员上传后暂存），直接本地拷贝，无需 TCP 回环
+  function runLocalCopy(file_id, dest) {
+    db.updateFileStatus(file_id, FILE_STATUS.DOWNLOADING);
+    const src = net.getFileStorePath(file_id);
+    const fileSize = db.getFile(file_id)?.file_size || 0;
+    const rs = fs.createReadStream(src);
+    const ws = fs.createWriteStream(dest);
+    let received = 0;
+    let lastFlush = 0;
+    rs.on('data', (chunk) => {
+      received += chunk.length;
+      const progress = fileSize > 0 ? received / fileSize : 0;
+      send(IPC_EVENT.FILE_DOWNLOAD_PROGRESS, { file_id, progress });
+      const now = Date.now();
+      if (now - lastFlush > 1000) {
+        db.updateFileProgress(file_id, received);
+        lastFlush = now;
+      }
+    });
+    rs.on('error', (err) => {
+      ws.destroy();
+      db.updateFileProgress(file_id, received, dest);
+      db.updateFileStatus(file_id, FILE_STATUS.FAILED);
+      send(IPC_EVENT.FILE_DOWNLOAD_COMPLETE, { file_id, error: String(err) });
+    });
+    ws.on('error', (err) => {
+      rs.destroy();
+      db.updateFileProgress(file_id, received, dest);
+      db.updateFileStatus(file_id, FILE_STATUS.FAILED);
+      send(IPC_EVENT.FILE_DOWNLOAD_COMPLETE, { file_id, error: String(err) });
+    });
+    rs.pipe(ws).on('finish', () => {
+      db.updateFileStatus(file_id, FILE_STATUS.COMPLETED, dest);
+      db.updateFileProgress(file_id, 0);
+      db.clearFileParts(file_id);
+      send(IPC_EVENT.FILE_DOWNLOAD_PROGRESS, { file_id, progress: 1 });
+      send(IPC_EVENT.FILE_DOWNLOAD_COMPLETE, { file_id, storage_path: dest });
+    });
+  }
+
   ipcMain.handle(IPC.FILE_DOWNLOAD, async (_e, { file_id, host_ip, host_port }) => {
     // 查找原始文件名
     const fileRow = db.queryOne('SELECT file_name FROM files WHERE file_id = ?', [file_id]);
@@ -414,21 +613,62 @@ function registerIpcHandlers() {
     if (result.canceled || !result.filePath) {
       return { ok: false, canceled: true };
     }
-    const dest = result.filePath;
+    // 主机本机已有暂存文件：直接本地拷贝
+    if (net.fileExistsOnHost(file_id)) {
+      runLocalCopy(file_id, result.filePath);
+      return { ok: true };
+    }
+    runDownload(file_id, host_ip, host_port, result.filePath, 0);
+    return { ok: true };
+  });
 
-    db.updateFileStatus(file_id, FILE_STATUS.DOWNLOADING);
-    net.downloadFile(host_ip, host_port, file_id, dest,
-      (progress) => send(IPC_EVENT.FILE_DOWNLOAD_PROGRESS, { file_id, progress }),
-      (err, finalPath) => {
-        if (err) {
-          db.updateFileStatus(file_id, FILE_STATUS.FAILED);
-          send(IPC_EVENT.FILE_DOWNLOAD_COMPLETE, { file_id, error: String(err) });
-        } else {
-          db.updateFileStatus(file_id, FILE_STATUS.COMPLETED, finalPath);
-          send(IPC_EVENT.FILE_DOWNLOAD_COMPLETE, { file_id, storage_path: finalPath });
-        }
+  // 断点续传：有 file_parts 记录走多 part 并行续传，否则单连接续传。无有效分片时返回 ok:false 供渲染层回退
+  ipcMain.handle(IPC.FILE_RESUME, async (_e, { file_id, host_ip, host_port }) => {
+    const file = db.getFile(file_id);
+    if (!file) return { ok: false, error: 'file record not found' };
+    const dest = file.storage_path;
+    if (!dest) return { ok: false, error: 'no storage path' };
+
+    // 主机本机已有暂存文件：直接本地拷贝（源文件完整，无需续传分片）
+    if (net.fileExistsOnHost(file_id)) {
+      runLocalCopy(file_id, dest);
+      return { ok: true };
+    }
+
+    // 有 file_parts 记录 → 多 part 并行续传
+    const parts = db.listFileParts(file_id);
+    if (parts.length > 0) {
+      const incomplete = parts.filter((p) => p.received_bytes < p.length);
+      if (incomplete.length === 0) return { ok: false, error: 'already complete' };
+      // 校验分片文件存在且预分配到全尺寸
+      try {
+        const stat = fs.statSync(dest);
+        if (stat.size < file.file_size) fs.truncateSync(dest, file.file_size);
+      } catch {
+        return { ok: false, error: 'partial file missing' };
       }
-    );
+      const ranges = incomplete.map((p) => ({
+        part_id: p.part_id, offset: p.offset, length: p.length, received: p.received_bytes
+      }));
+      db.updateFileStatus(file_id, FILE_STATUS.DOWNLOADING);
+      runDownloadParallel(file_id, host_ip, host_port, dest, file.file_size, ranges, true);
+      return { ok: true };
+    }
+
+    // 无 file_parts → 单连接续传（小文件或旧记录）
+    const offset = file.received_bytes || 0;
+    if (offset <= 0 || offset >= file.file_size) {
+      return { ok: false, error: 'no resumable partial' };
+    }
+    try {
+      const stat = fs.statSync(dest);
+      if (stat.size !== offset) {
+        return { ok: false, error: 'partial size mismatch' };
+      }
+    } catch (e) {
+      return { ok: false, error: 'partial file missing' };
+    }
+    runDownload(file_id, host_ip, host_port, dest, offset);
     return { ok: true };
   });
 

@@ -47,7 +47,18 @@ CREATE TABLE IF NOT EXISTS files (
   file_size       INTEGER,
   storage_path    TEXT,
   download_status TEXT,
+  received_bytes  INTEGER DEFAULT 0,
   FOREIGN KEY (message_id) REFERENCES messages(message_id)
+);
+
+CREATE TABLE IF NOT EXISTS file_parts (
+  file_id        TEXT,
+  part_id        INTEGER,
+  offset         INTEGER,
+  length         INTEGER,
+  received_bytes INTEGER DEFAULT 0,
+  status         TEXT,
+  PRIMARY KEY (file_id, part_id)
 );
 
 CREATE TABLE IF NOT EXISTS settings (

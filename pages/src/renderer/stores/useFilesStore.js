@@ -28,6 +28,19 @@ export const useFilesStore = create(
       }
     },
 
+    // 断点续传：复用已下载分片；无有效分片时回退为全新下载
+    resume: async (fileId, hostIp, hostPort) => {
+      set((state) => ({
+        status: { ...state.status, [fileId]: 'downloading' },
+        progress: { ...state.progress, [fileId]: 0 }
+      }));
+      const res = await window.api.invoke('file:resume', { file_id: fileId, host_ip: hostIp, host_port: hostPort });
+      if (res && res.ok === false) {
+        // 无可续传分片：回退为全新下载（会弹保存对话框）
+        await get().download(fileId, hostIp, hostPort);
+      }
+    },
+
     setProgress: (fileId, progress) => {
       set((state) => ({ progress: { ...state.progress, [fileId]: progress } }));
     },

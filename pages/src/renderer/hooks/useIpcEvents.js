@@ -94,9 +94,9 @@ export function useIpcEvents() {
     );
     // V15：文件下载进度用 rAF 节流，避免每个 TCP 块都触发 React 重渲染
     let pendingProgress = {};
-    let rafScheduled = false;
+    let progressRafScheduled = false;
     const flushProgress = () => {
-      rafScheduled = false;
+      progressRafScheduled = false;
       const store = useFilesStore.getState();
       for (const [fid, p] of Object.entries(pendingProgress)) {
         store.setProgress(fid, p);
@@ -106,8 +106,8 @@ export function useIpcEvents() {
     unsubs.push(
       window.api.on('file:download-progress', ({ file_id, progress }) => {
         pendingProgress[file_id] = progress;
-        if (!rafScheduled) {
-          rafScheduled = true;
+        if (!progressRafScheduled) {
+          progressRafScheduled = true;
           requestAnimationFrame(flushProgress);
         }
       })

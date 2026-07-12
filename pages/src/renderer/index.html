@@ -2,7 +2,15 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://localhost:5173 http://localhost:5173; object-src 'none'; base-uri 'self';" />
+    <!--
+      CSP 说明：
+      - dev (http://localhost:5173) 与 prod (file://) 的 origin 不同；
+        file:// 协议下 'self' 会被 Chromium 视作 null origin，因此必须显式允许 file:。
+      - 渲染进程启用了 contextIsolation + sandbox + nodeIntegration=false，
+        'unsafe-inline' 仅用于 style（Vite 在开发期会注入内联样式）。
+      - connect-src 需要放行 ws/http 以便 dev server HMR 正常工作；生产期实际只走 IPC。
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob: file:; script-src 'self' file:; style-src 'self' 'unsafe-inline' file:; img-src 'self' data: blob: file:; font-src 'self' data: file:; connect-src 'self' ws: wss: http: https: file: blob:; object-src 'none'; base-uri 'self';" />
     <title>LANChatroom // 局域网通讯终端</title>
   </head>
   <body>

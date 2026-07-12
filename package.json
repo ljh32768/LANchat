@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
-    "build": "electron-builder",
+    "build": "vite build",
     "preview": "electron .",
     "dist": "npm run build && electron-builder --win",
     "dist:portable": "npm run build && electron-builder --win portable",

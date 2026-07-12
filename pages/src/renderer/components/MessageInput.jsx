@@ -51,7 +51,8 @@ export default function MessageInput({ sessionId, disabled }) {
       }
     } catch (e) {
       console.error('upload failed:', e);
-      alert('文件发送失败：' + (e.message || e));
+      const reason = e?.message || String(e) || '未知错误';
+      alert('文件发送失败：' + reason + '\n\n请检查网络连接后重试，或让会话主机重新创建会话。');
     } finally {
       setUploading(false);
     }

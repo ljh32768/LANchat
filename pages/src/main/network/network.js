@@ -871,7 +871,7 @@ class NetworkManager extends EventEmitter {
     const bufSize = 4 * 1024 * 1024;
     try { socket.setSendBufferSize(bufSize); socket.setRecvBufferSize(bufSize); } catch {}
     // received: 追踪实际接收字节，用于完成后校验，防止 size 不匹配时误报成功
-    const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, remaining: 0, received: 0, header: null, done: false };
+    const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, remaining: 0, received: 0, header: null, done: false, uploadTimer: null };
     socket.on('data', (chunk) => {
       if (state.phase === 'header') {
         state.buf = Buffer.concat([state.buf, chunk]);
@@ -894,8 +894,9 @@ class NetworkManager extends EventEmitter {
           state.ws = fs.createWriteStream(dest, { highWaterMark: 512 * 1024 });
           state.ws.on('drain', () => socket.resume()); // 写盘就绪后恢复接收
           state.ws.on('error', (e) => {
-            console.error('[net] upload writeStream error:', e.message, 'file_id', header.file_id);
+            console.error('[net] upload writeStream error:', e.message, 'file_id', header.file_id, 'received', state.received, 'remaining', state.remaining);
             state.done = true;
+            this._clearUploadTimer(state);
             this._sendJson(socket, { kind: 'upload-error', file_id: header.file_id, reason: 'write failed' });
             socket.destroy();
           });
@@ -907,6 +908,12 @@ class NetworkManager extends EventEmitter {
           } catch {}
           state.remaining = header.file_size;
           state.phase = 'body';
+          // 最大上传持续时间保护：防止连接在背压/异常下永远挂起
+          state.uploadTimer = setTimeout(() => {
+            console.error('[net] upload max duration exceeded, destroying socket. file_id', header.file_id, 'received', state.received, 'remaining', state.remaining);
+            state.done = true;
+            socket.destroy();
+          }, 10 * 60 * 1000);
           if (rest.length) this._consumeUploadBody(state, rest, socket);
         }
       } else if (state.phase === 'body') {
@@ -915,8 +922,9 @@ class NetworkManager extends EventEmitter {
     });
     // 错误处理：socket 错误时清理 writeStream 并销毁 socket
     socket.on('error', (e) => {
-      console.error('[net] file socket error:', e.code || e.message);
+      console.error('[net] file socket error:', e.code || e.message, 'file_id', state.header?.file_id, 'received', state.received, 'remaining', state.remaining);
       state.done = true;
+      this._clearUploadTimer(state);
       if (state.ws) { try { state.ws.destroy(); } catch {} }
       socket.destroy();
     });
@@ -924,7 +932,15 @@ class NetworkManager extends EventEmitter {
     socket.on('close', () => {
       if (state.ws && !state.done) { try { state.ws.destroy(); } catch {} }
       state.done = true;
+      this._clearUploadTimer(state);
     });
+  }
+
+  _clearUploadTimer(state) {
+    if (state && state.uploadTimer) {
+      clearTimeout(state.uploadTimer);
+      state.uploadTimer = null;
+    }
   }
 
   _consumeUploadBody(state, chunk, socket) {
@@ -940,6 +956,7 @@ class NetworkManager extends EventEmitter {
       // 等 writeStream 完全落盘后再发 upload-done，确保数据持久化后再通知客户端
       // 同时校验实际接收字节数，防止 size 不匹配时误报成功
       state.ws.end(() => {
+        this._clearUploadTimer(state);
         const expected = state.header.file_size;
         if (state.received !== expected) {
           console.warn('[net] upload size mismatch: expected', expected, 'got', state.received, 'file_id', state.header.file_id);
@@ -1025,10 +1042,18 @@ class NetworkManager extends EventEmitter {
           sock.write(Buffer.from(JSON.stringify({
             kind: 'upload', file_id, file_name, file_size, session_id: sessionId
           }) + '\n', 'utf8'));
-          // pipe 自动处理背压；超时由 socket.setTimeout 按非活动自动重置
+          // 核心修复：pipe 默认 { end: true } 会在文件流结束时自动 sock.end()，
+          // 导致连接提前 half-close。在 Windows/某些网络栈下，客户端可能在收到
+          // 服务端 upload-done 响应前就先触发 end 事件，从而误报
+          // "connection closed before upload-done"。使用 { end: false } 保持 socket
+          // 双向开放，直到收到 upload-done 后再主动 sock.end()。
           const stream = fs.createReadStream(file_path, { highWaterMark: 512 * 1024 });
-          stream.pipe(sock);
+          stream.pipe(sock, { end: false });
           stream.on('error', (e) => { sock.destroy(); finish(e); });
+          stream.on('end', () => {
+            // 文件数据已全部写入内核发送缓冲；保持 socket 可写开放，
+            // 等待服务端返回 upload-done 后再结束连接。
+          });
         });
 
         // data 监听器双重作用：保持 socket flowing mode + 解析 upload-done/upload-error 响应
@@ -1047,6 +1072,9 @@ class NetworkManager extends EventEmitter {
                 // 阶段3：校验主机实际接收字节数，防止 size 不匹配时误判成功
                 if (msg.received != null && msg.received !== file_size) {
                   finish(new Error('host received size mismatch: expected ' + file_size + ' got ' + msg.received));
+                } else {
+                  // 握手完成：此时才关闭客户端 socket，让服务端正常收到 FIN
+                  sock.end();
                 }
               } else if (msg.kind === 'upload-error') {
                 finish(new Error('host error: ' + (msg.reason || 'unknown')));
@@ -1067,6 +1095,9 @@ class NetworkManager extends EventEmitter {
             else finish(new Error('socket closed unexpectedly'));
           }
         });
+        // 当服务端已发 upload-done 后，客户端主动 sock.end() 会触发 finishable 状态；
+        // 这里不再需要额外处理，因为收到 upload-done 时已标记 gotUploadDone，
+        // 随后 sock.end() 触发 'end' 事件，finish(null) 被调用。
         sock.on('error', (e) => finish(e));
         sock.on('timeout', () => finish(new Error('upload timeout')));
       };

@@ -49,7 +49,7 @@
       "shortcutName": "LANChatroom",
       "uninstallDisplayName": "LANChatroom 0.1.1"
     },
-    "compression": "maximum",
+    "compression": "store",
     "electronDist": "node_modules/electron/dist",
     "asarUnpack": [
       "node_modules/sql.js/dist/sql-wasm.wasm"

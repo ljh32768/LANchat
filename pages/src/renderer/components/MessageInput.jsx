@@ -26,11 +26,32 @@ export default function MessageInput({ sessionId, disabled }) {
     if (!filePath) return;
     setUploading(true);
     try {
-      await upload(sessionId, filePath);
-      // 文件消息会通过 IPC 返回并由本地 store 补一条；此处主动重载消息
-      await useMessagesStore.getState().load(sessionId);
+      const res = await upload(sessionId, filePath);
+      // 直接添加文件消息到 store，避免 load 竞态导致后续文本消息被覆盖
+      if (res && res.file_id) {
+        useMessagesStore.setState((state) => {
+          const list = state.messagesBySession[sessionId] || [];
+          // 幂等：已有该 message_id 则跳过
+          if (list.some((m) => m.message_id === res.message_id)) return state;
+          return {
+            messagesBySession: {
+              ...state.messagesBySession,
+              [sessionId]: [...list, {
+                message_id: res.message_id,
+                session_id: sessionId,
+                sender_contact_id: 'self',
+                content: JSON.stringify({ file_id: res.file_id, file_name: res.file_name, file_size: res.file_size }),
+                type: 'file',
+                timestamp: res.timestamp,
+                local_id: res.local_id
+              }]
+            }
+          };
+        });
+      }
     } catch (e) {
       console.error('upload failed:', e);
+      alert('文件发送失败：' + (e.message || e));
     } finally {
       setUploading(false);
     }

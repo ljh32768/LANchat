@@ -45,7 +45,7 @@ function enqueueMessage(session_id, content, type) {
   let q = messageQueue.get(queueKey);
 
   if (!q) {
-    q = { queue: [], lastTs: timestamp, currentMsg: null };
+    q = { queue: [], lastTs: timestamp - 1000, currentMsg: null };
     messageQueue.set(queueKey, q);
   }
 
@@ -94,16 +94,43 @@ function enqueueMessage(session_id, content, type) {
     }
     q.currentMsg = null;
 
-    // 处理队列中的下一条消息
+    // 处理队列中的下一条消息（直接发送，不再经过速率限制，保持原始 message_id）
     if (q.queue.length > 0) {
       const nextMsg = q.queue.shift();
       // 使用 setTimeout 允许事件循环处理其他任务
-      setTimeout(() => enqueueMessage(nextMsg.session_id, nextMsg.content, nextMsg.type), 0);
+      setTimeout(() => flushQueuedMessage(nextMsg, q), 0);
     }
   };
 
   sendMsg();
   return { message_id, timestamp, local_id };
+}
+
+// 直接发送队列中的消息（不经过速率限制，保持原始 message_id）
+function flushQueuedMessage(msg, q) {
+  // 写入 DB
+  db.addMessage({
+    message_id: msg.message_id,
+    session_id: msg.session_id,
+    sender_contact_id: msg.sender_contact_id,
+    content: msg.content,
+    type: msg.type,
+    timestamp: msg.timestamp,
+    local_id: msg.local_id
+  });
+
+  // 网络发送
+  if (net.isHosting(msg.session_id)) {
+    net.relayToMembers(msg.session_id, msg);
+  } else if (net.isJoined(msg.session_id)) {
+    net.memberSend(msg.session_id, msg);
+  }
+
+  // 继续处理队列中的下一条
+  if (q && q.queue.length > 0) {
+    const nextMsg = q.queue.shift();
+    setTimeout(() => flushQueuedMessage(nextMsg, q), 0);
+  }
 }
 
 // V13：昵称/名称后端校验（长度上限 + 去除换行/尖括号）
@@ -200,18 +227,33 @@ function registerNetworkEvents() {
       const rows = db.listMessages(session_id);
       if (rows.length === 0) return;
       // 组装成与实时 msg 一致的结构，接收方 handleReceivedMessage 幂等入库
-      const messages = rows.map((r) => ({
-        kind: 'msg',
-        message_id: r.message_id,
-        session_id: r.session_id,
-        sender_contact_id: r.sender_contact_id,
-        sender_nickname: r.sender_nickname,
-        sender_ip: r.sender_ip,
-        content: r.content,
-        type: r.type,
-        timestamp: r.timestamp,
-        local_id: r.local_id
-      }));
+      const messages = rows.map((r) => {
+        const m = {
+          kind: 'msg',
+          message_id: r.message_id,
+          session_id: r.session_id,
+          sender_contact_id: r.sender_contact_id,
+          sender_nickname: r.sender_nickname,
+          sender_ip: r.sender_ip,
+          content: r.content,
+          type: r.type,
+          timestamp: r.timestamp,
+          local_id: r.local_id
+        };
+        // 文件消息：从 content JSON 中提取 file_id / file_name / file_size，
+        // 否则接收方 handleReceivedMessage 因缺少 file_id 无法创建文件记录
+        if (r.type === MSG_TYPE.FILE && r.content) {
+          try {
+            const meta = JSON.parse(r.content);
+            if (meta.file_id) {
+              m.file_id = meta.file_id;
+              m.file_name = meta.file_name;
+              m.file_size = meta.file_size;
+            }
+          } catch {}
+        }
+        return m;
+      });
       net.sendHistoryToMember(session_id, client_id, messages);
     } catch (e) {
       console.error('[ipc] member-joined history push error:', e);
@@ -393,7 +435,13 @@ function registerIpcHandlers() {
   // ---- 文件 ----
   ipcMain.handle(IPC.FILE_UPLOAD, async (_e, { session_id, file_path }) => {
     const client = db.getClientInfo();
-    const stat = fs.statSync(file_path);
+    // 阶段4：IPC 层错误处理——文件读取失败时直接返回，不创建消息记录
+    let stat;
+    try {
+      stat = fs.statSync(file_path);
+    } catch (e) {
+      return { ok: false, error: '无法读取文件: ' + (e.message || e) };
+    }
     const file_id = uuidv4();
     const message_id = uuidv4();
     const local_id = uuidv4();
@@ -401,18 +449,24 @@ function registerIpcHandlers() {
     const file_name = path.basename(file_path);
     const file_size = stat.size;
 
-    if (net.isHosting(session_id)) {
-      // 本机即主机：本地暂存
-      await new Promise((res, rej) => {
-        net.storeLocalFile(file_id, file_path, (e) => (e ? rej(e) : res()));
-      });
-    } else if (net.isJoined(session_id)) {
-      // 成员：上传到主机暂存
-      await new Promise((res, rej) => {
-        net.uploadFileToHost(session_id, { file_id, file_name, file_size, file_path }, (e) =>
-          e ? rej(e) : res()
-        );
-      });
+    try {
+      if (net.isHosting(session_id)) {
+        // 本机即主机：本地暂存
+        await new Promise((res, rej) => {
+          net.storeLocalFile(file_id, file_path, (e) => (e ? rej(e) : res()));
+        });
+      } else if (net.isJoined(session_id)) {
+        // 成员：上传到主机暂存（network 层已含自动重试，最多 2 次）
+        await new Promise((res, rej) => {
+          net.uploadFileToHost(session_id, { file_id, file_name, file_size, file_path }, (e) =>
+            e ? rej(e) : res()
+          );
+        });
+      }
+    } catch (e) {
+      // 阶段4：上传失败时返回错误，不创建消息记录（避免渲染层显示无法下载的文件消息）
+      console.error('[ipc] file upload failed:', e.message);
+      return { ok: false, error: String(e.message || e) };
     }
 
     // 创建文件消息记录
@@ -453,7 +507,7 @@ function registerIpcHandlers() {
     if (net.isHosting(session_id)) net.relayToMembers(session_id, fileMsg);
     else if (net.isJoined(session_id)) net.memberSend(session_id, fileMsg);
 
-    return { file_id, message_id, timestamp };
+    return { ok: true, file_id, message_id, timestamp, file_name, file_size, local_id };
   });
 
   // 断点续传：节流写库的已接收字节，最多每 1s 持久化一次（失败后据此续传）

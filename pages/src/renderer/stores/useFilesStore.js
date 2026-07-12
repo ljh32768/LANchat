@@ -10,6 +10,10 @@ export const useFilesStore = create(
 
     upload: async (sessionId, filePath) => {
       const res = await window.api.invoke('file:upload', { session_id: sessionId, file_path: filePath });
+      // 阶段4：上传失败时抛出错误，让调用方 catch 能处理（主进程返回 { ok: false, error }）
+      if (res && res.ok === false) {
+        throw new Error(res.error || '上传失败');
+      }
       return res;
     },
 

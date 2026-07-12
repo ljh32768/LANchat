@@ -131,7 +131,8 @@ if (!gotTheLock) {
     ipcMain.handle('dialog:open-file', async () => {
       const result = await dialog.showOpenDialog(mainWindow, {
         title: '选择要发送的文件',
-        properties: ['openFile']
+        properties: ['openFile'],
+        filters: [{ name: '所有文件', extensions: ['*'] }]
       });
       if (result.canceled || result.filePaths.length === 0) return null;
       return result.filePaths[0];

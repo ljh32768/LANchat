@@ -392,6 +392,10 @@ class NetworkManager extends EventEmitter {
         try { ctx.socket.removeAllListeners(); ctx.socket.destroy(); } catch {}
         this.joined.delete(sid);
         this.emit('session-removed', { session_id: sid });
+      } else {
+        // TCP 已断但主机还在线 → 直接触发重连，不调用 destroy() 避免 close 事件重入
+        console.warn('[net] sweep: tcp dead but host online, trigger reconnect', sid.slice(0, 8));
+        this._reconnectJoined(sid);
       }
     }
   }
@@ -461,7 +465,8 @@ class NetworkManager extends EventEmitter {
     // V5：TCP keep-alive + 超时 + 禁用 Nagle
     socket.setKeepAlive(true, 30000);
     socket.setNoDelay(true);
-    socket.setTimeout(60000);
+    // 空闲超时设为 300s（大文件传输时会话连接可能长时间无消息，60s 过短）
+    socket.setTimeout(300000);
     socket.on('timeout', () => {
       console.warn('[net] host socket idle timeout, destroy', socket.remoteAddress);
       socket.destroy();
@@ -649,6 +654,11 @@ class NetworkManager extends EventEmitter {
       console.log('[net] joinSession closed:', hostIp + ':' + hostPort, 'ended flag=', ctx.ended);
       this._stopHeartbeat(sessionId);
       if (ctx.ended) return; // 主机解散，已处理
+      // 如果已经在重连中（_sweep 已触发），跳过，防止重入
+      if (ctx.reconnectAttempts > 0) {
+        console.log('[net] close: already reconnecting, skip', sessionId.slice(0, 8));
+        return;
+      }
       // 网络抖动：自动重连
       this._reconnectJoined(sessionId);
     });
@@ -835,20 +845,33 @@ class NetworkManager extends EventEmitter {
   }
 
   // 文件传输 socket 调优：禁用 Nagle、开启 keepAlive、调大收发缓冲区以充分利用局域网带宽
-  _tuneFileSocket(socket) {
+  // fileSize 用于动态调整缓冲区和超时：大文件用 4MB 缓冲 + 更长超时，避免大文件传输中途超时
+  _tuneFileSocket(socket, fileSize = 0) {
     socket.setNoDelay(true);
     socket.setKeepAlive(true, 30000);
-    socket.setTimeout(120000);
+    // 超时根据文件大小动态计算：基础 120s，每 100MB 加 60s，上限 600s
+    // setTimeout 是"非活动超时"，有数据流动会自动重置，主要防卡死
+    const timeout = Math.min(600000, 120000 + Math.floor(fileSize / (100 * 1024 * 1024)) * 60000);
+    socket.setTimeout(timeout);
+    // 缓冲区：≥50MB 用 4MB，否则 1MB（平衡内存占用与吞吐量）
+    const bufSize = fileSize >= 50 * 1024 * 1024 ? 4 * 1024 * 1024 : 1024 * 1024;
     try {
-      socket.setSendBufferSize(1024 * 1024);
-      socket.setRecvBufferSize(1024 * 1024);
+      socket.setSendBufferSize(bufSize);
+      socket.setRecvBufferSize(bufSize);
     } catch (e) { /* 部分平台可能忽略，静默降级 */ }
   }
 
   _onFileSocket(socket) {
-    this._tuneFileSocket(socket);
-    const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, remaining: 0, header: null };
-    // 超时由 socket.setTimeout（_tuneFileSocket 内设置）驱动，按非活动自动重置
+    // 服务端文件 socket 不设 idle timeout：socket.pause() 因背压暂停时无 data 事件，
+    // 此时 idle timeout 会误触发，导致连接被意外断开。客户端（uploadFileToHost / downloadFile）
+    // 已有自己的超时机制，超时后会主动断开连接，触发服务端的 close 清理。
+    // 仅调优缓冲区大小和禁用 Nagle，不设 timeout。
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 30000);
+    const bufSize = 4 * 1024 * 1024;
+    try { socket.setSendBufferSize(bufSize); socket.setRecvBufferSize(bufSize); } catch {}
+    // received: 追踪实际接收字节，用于完成后校验，防止 size 不匹配时误报成功
+    const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, remaining: 0, received: 0, header: null, done: false };
     socket.on('data', (chunk) => {
       if (state.phase === 'header') {
         state.buf = Buffer.concat([state.buf, chunk]);
@@ -870,6 +893,18 @@ class NetworkManager extends EventEmitter {
           if (!dest) { console.warn('[net] reject unsafe file_id', header.file_id); socket.destroy(); return; }
           state.ws = fs.createWriteStream(dest, { highWaterMark: 512 * 1024 });
           state.ws.on('drain', () => socket.resume()); // 写盘就绪后恢复接收
+          state.ws.on('error', (e) => {
+            console.error('[net] upload writeStream error:', e.message, 'file_id', header.file_id);
+            state.done = true;
+            this._sendJson(socket, { kind: 'upload-error', file_id: header.file_id, reason: 'write failed' });
+            socket.destroy();
+          });
+          // 后调优：按文件大小设置缓冲区（不设 timeout）
+          try {
+            const bufSize2 = header.file_size >= 50 * 1024 * 1024 ? 4 * 1024 * 1024 : 1024 * 1024;
+            socket.setSendBufferSize(bufSize2);
+            socket.setRecvBufferSize(bufSize2);
+          } catch {}
           state.remaining = header.file_size;
           state.phase = 'body';
           if (rest.length) this._consumeUploadBody(state, rest, socket);
@@ -878,21 +913,44 @@ class NetworkManager extends EventEmitter {
         this._consumeUploadBody(state, chunk, socket);
       }
     });
-    socket.on('timeout', () => { console.warn('[net] file socket timeout, destroy'); if (state.ws) state.ws.destroy(); socket.destroy(); });
-    socket.on('error', () => { if (state.ws) state.ws.destroy(); });
+    // 错误处理：socket 错误时清理 writeStream 并销毁 socket
+    socket.on('error', (e) => {
+      console.error('[net] file socket error:', e.code || e.message);
+      state.done = true;
+      if (state.ws) { try { state.ws.destroy(); } catch {} }
+      socket.destroy();
+    });
+    // close 清理：客户端断开后确保 writeStream 关闭，避免资源泄漏
+    socket.on('close', () => {
+      if (state.ws && !state.done) { try { state.ws.destroy(); } catch {} }
+      state.done = true;
+    });
   }
 
   _consumeUploadBody(state, chunk, socket) {
-    if (state.remaining <= 0) return;
+    if (state.remaining <= 0 || state.done) return;
     const toWrite = chunk.slice(0, state.remaining);
     const ok = state.ws.write(toWrite);
+    state.received += toWrite.length;
     state.remaining -= toWrite.length;
     if (state.remaining <= 0) {
-      state.ws.end();
+      // 标记 done 防止后续 data 事件重复触发完成逻辑
+      state.done = true;
       state.phase = 'done';
-      this._sendJson(socket, { kind: 'upload-done', file_id: state.header.file_id });
-      socket.end();
-      this.emit('file-uploaded', { file_id: state.header.file_id, file_name: state.header.file_name });
+      // 等 writeStream 完全落盘后再发 upload-done，确保数据持久化后再通知客户端
+      // 同时校验实际接收字节数，防止 size 不匹配时误报成功
+      state.ws.end(() => {
+        const expected = state.header.file_size;
+        if (state.received !== expected) {
+          console.warn('[net] upload size mismatch: expected', expected, 'got', state.received, 'file_id', state.header.file_id);
+          this._sendJson(socket, { kind: 'upload-error', file_id: state.header.file_id, reason: 'size mismatch', received: state.received });
+          socket.destroy();
+          return;
+        }
+        this._sendJson(socket, { kind: 'upload-done', file_id: state.header.file_id, received: state.received });
+        socket.end();
+        this.emit('file-uploaded', { file_id: state.header.file_id, file_name: state.header.file_name });
+      });
     } else if (!ok) {
       socket.pause(); // 写盘跟不上则暂停接收，drain 后由 resume 恢复
     }
@@ -913,37 +971,107 @@ class NetworkManager extends EventEmitter {
       return;
     }
     const actualLength = end - offset + 1;
+    // 按实际传输长度调优缓冲区（不设 idle timeout，原因同 _onFileSocket）
+    try {
+      socket.setSendBufferSize(Math.min(4 * 1024 * 1024, Math.max(1024 * 1024, actualLength)));
+      socket.setRecvBufferSize(Math.min(4 * 1024 * 1024, Math.max(1024 * 1024, actualLength)));
+    } catch {}
     socket.write(Buffer.from(JSON.stringify({ kind: 'download-start', file_id: fileId, size: stat.size, offset, length: actualLength }) + '\n', 'utf8'));
     // 从 offset 到 end 读取；pipe 自动处理背压
     const stream = fs.createReadStream(filePath, { start: offset, end, highWaterMark: 512 * 1024 });
+    // 阶段4：增强错误处理——stream 错误时记录日志并销毁 socket，socket 错误时销毁 stream 避免资源泄漏
+    stream.on('error', (e) => {
+      console.error('[net] serveFileDownload stream error:', e.message, 'fileId', fileId);
+      socket.destroy();
+    });
+    socket.on('error', () => { try { stream.destroy(); } catch {} });
     stream.pipe(socket);
-    stream.on('error', () => socket.destroy());
   }
 
   // 成员上传文件到主机暂存（头部 + 原始字节）
+  // 阶段1-4：异步队列 + 动态缓冲 + 双重完成检测 + 自动重试（最多 2 次）
   uploadFileToHost(sessionId, { file_id, file_name, file_size, file_path }, cb) {
     const ctx = this.joined.get(sessionId);
     if (!ctx) { cb(new Error('not joined')); return; }
+
     this._enqueueFileTransfer(() => {
-      const sock = net.createConnection({ host: ctx.host_ip, port: this.fileServerPort });
-      this._tuneFileSocket(sock);
-      let called = false;
-      const done = (err) => { if (called) return; called = true; this._finishFileTransfer(); cb(err); };
-      sock.on('connect', () => {
-        sock.write(Buffer.from(JSON.stringify({
-          kind: 'upload', file_id, file_name, file_size, session_id: sessionId
-        }) + '\n', 'utf8'));
-        // pipe 自动处理背压；超时由 socket.setTimeout 按非活动自动重置
-        const stream = fs.createReadStream(file_path, { highWaterMark: 512 * 1024 });
-        stream.pipe(sock);
-        stream.on('error', (e) => { sock.destroy(); done(e); });
-      });
-      // 必须有 data 监听器保持 socket 流动模式：否则 upload-done 响应滞留内部缓冲，
-      // end 事件不触发，客户端挂起至超时
-      sock.on('data', () => {});
-      sock.on('end', () => done(null)); // 收到 upload-done 且对端关闭
-      sock.on('error', (e) => done(e));
-      sock.on('timeout', () => { sock.destroy(); done(new Error('upload timeout')); });
+      let attempt = 0;
+      const maxAttempts = 2;
+
+      const tryUpload = () => {
+        const sock = net.createConnection({ host: ctx.host_ip, port: this.fileServerPort });
+        this._tuneFileSocket(sock, file_size);
+        let called = false;
+        let gotUploadDone = false; // 阶段3：状态追踪，主机是否发来 upload-done 确认
+        let responseBuf = '';
+
+        const finish = (err) => {
+          if (called) return;
+          called = true;
+          try { sock.removeAllListeners(); sock.destroy(); } catch {}
+
+          // 阶段4：失败时自动重试（最多 2 次），队列槽位在整个重试过程中保持占用
+          if (err && attempt + 1 < maxAttempts) {
+            attempt++;
+            console.warn('[net] upload attempt', attempt, 'failed, retrying in 1s:', err.message);
+            setTimeout(tryUpload, 1000);
+            return;
+          }
+          this._finishFileTransfer();
+          cb(err);
+        };
+
+        sock.on('connect', () => {
+          sock.write(Buffer.from(JSON.stringify({
+            kind: 'upload', file_id, file_name, file_size, session_id: sessionId
+          }) + '\n', 'utf8'));
+          // pipe 自动处理背压；超时由 socket.setTimeout 按非活动自动重置
+          const stream = fs.createReadStream(file_path, { highWaterMark: 512 * 1024 });
+          stream.pipe(sock);
+          stream.on('error', (e) => { sock.destroy(); finish(e); });
+        });
+
+        // data 监听器双重作用：保持 socket flowing mode + 解析 upload-done/upload-error 响应
+        // 不挂 data 监听会导致响应滞留内部缓冲，end 事件不触发，客户端挂起至超时
+        sock.on('data', (data) => {
+          responseBuf += data.toString('utf8');
+          // 按行解析响应（主机发 upload-done 后会 socket.end()）
+          const lines = responseBuf.split('\n');
+          responseBuf = lines.pop() || ''; // 保留最后不完整的行
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const msg = JSON.parse(line);
+              if (msg.kind === 'upload-done') {
+                gotUploadDone = true;
+                // 阶段3：校验主机实际接收字节数，防止 size 不匹配时误判成功
+                if (msg.received != null && msg.received !== file_size) {
+                  finish(new Error('host received size mismatch: expected ' + file_size + ' got ' + msg.received));
+                }
+              } else if (msg.kind === 'upload-error') {
+                finish(new Error('host error: ' + (msg.reason || 'unknown')));
+              }
+            } catch {}
+          }
+        });
+
+        // 阶段3：双重检测——必须同时收到 upload-done 信号 + socket 正常关闭才算成功
+        sock.on('end', () => {
+          if (gotUploadDone) finish(null);
+          else finish(new Error('connection closed before upload-done'));
+        });
+        // close 兜底：error/destroy 后 end 可能不触发，close 在所有断开路径都会触发
+        sock.on('close', () => {
+          if (!called) {
+            if (gotUploadDone) finish(null);
+            else finish(new Error('socket closed unexpectedly'));
+          }
+        });
+        sock.on('error', (e) => finish(e));
+        sock.on('timeout', () => finish(new Error('upload timeout')));
+      };
+
+      tryUpload();
     });
   }
 
@@ -982,6 +1110,8 @@ class NetworkManager extends EventEmitter {
             return;
           }
           state.size = header.size;
+          // 阶段2：收到文件实际大小后重新调优 socket（大文件用更大缓冲 + 更长超时）
+          this._tuneFileSocket(sock, state.size);
           state.ws = fs.createWriteStream(destPath, wsOpts);
           state.ws.on('drain', () => sock.resume()); // 写盘就绪后恢复接收
           state.ws.on('error', (e) => { sock.destroy(); done(e); });
@@ -1002,7 +1132,17 @@ class NetworkManager extends EventEmitter {
         }
       });
       sock.on('end', () => {
-        if (state.ws) state.ws.end(() => done(null, destPath)); else done(new Error('connection closed'));
+        if (state.ws) {
+          state.ws.end(() => {
+            // 阶段3：完整性校验——实际接收字节必须等于声明的文件大小（减去 offset 续传基数）
+            const expected = state.size - offset;
+            if (state.size > 0 && state.total - offset !== expected) {
+              done(new Error('download size mismatch: expected ' + expected + ' got ' + (state.total - offset)));
+            } else {
+              done(null, destPath);
+            }
+          });
+        } else done(new Error('connection closed'));
       });
       sock.on('error', (e) => { if (state.ws) state.ws.destroy(); done(e); });
       sock.on('timeout', () => { if (state.ws) state.ws.destroy(); sock.destroy(); done(new Error('download timeout')); });
@@ -1056,7 +1196,7 @@ class NetworkManager extends EventEmitter {
       if (remainingLength <= 0) { finishOne(idx, null); return; }
 
       const sock = net.createConnection({ host: hostIp, port: hostPort || this.fileServerPort });
-      this._tuneFileSocket(sock);
+      this._tuneFileSocket(sock, range.length);
       const wsOpts = { flags: 'r+', start: range.offset + alreadyReceived, highWaterMark: 512 * 1024 };
       const state = { phase: 'header', buf: Buffer.alloc(0), ws: null, total: alreadyReceived, size: range.length };
       let called = false;
@@ -1104,7 +1244,18 @@ class NetworkManager extends EventEmitter {
           if (!ok) sock.pause();
         }
       });
-      sock.on('end', () => { if (state.ws) state.ws.end(() => done(null)); else done(new Error('closed')); });
+      sock.on('end', () => {
+        if (state.ws) {
+          state.ws.end(() => {
+            // 阶段3：part 完整性校验——实际接收字节必须等于该 part 的声明长度
+            if (state.total !== range.length) {
+              done(new Error('part ' + range.part_id + ' size mismatch: expected ' + range.length + ' got ' + state.total));
+            } else {
+              done(null);
+            }
+          });
+        } else done(new Error('closed'));
+      });
       sock.on('error', (e) => done(e));
       sock.on('timeout', () => done(new Error('part timeout')));
     });

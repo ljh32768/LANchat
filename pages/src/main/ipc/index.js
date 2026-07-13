@@ -176,13 +176,16 @@ function handleReceivedMessage(msg) {
         }
         const already = db.queryOne('SELECT file_id FROM files WHERE file_id = ?', [meta.file_id]);
         if (!already) {
+          // 成员上传的文件已存储在主机本地（fileStoreDir/file_id），
+          // 主机直接标记 COMPLETED，渲染层显示"已暂存"
+          const isHost = net.isHosting(msg.session_id);
           db.addFile({
             file_id: meta.file_id,
             message_id: msg.message_id,
             file_name: meta.file_name,
             file_size: meta.file_size,
-            storage_path: null,
-            download_status: FILE_STATUS.PENDING
+            storage_path: isHost ? net.getFileStorePath(meta.file_id) : null,
+            download_status: isHost ? FILE_STATUS.COMPLETED : FILE_STATUS.PENDING
           });
         }
       }

@@ -35,57 +35,48 @@ export function useIpcEvents() {
       })
     );
     // V17：消息接收批处理（使用 RAF 聚合更新，避免频繁 React 重渲染）
+    // 未读只在此处按条数累加一次（addReceived 不再碰 unread）
     let pendingMessages = [];
-    let pendingSessionCounts = new Map();
     let rafScheduled = false;
     const flushUpdates = () => {
       rafScheduled = false;
 
-      // 批量处理消息
-      if (pendingMessages.length > 0) {
-        const messageStore = useMessagesStore.getState();
-        const sessionStore = useSessionsStore.getState();
-        const sessions = sessionStore.sessions;
-        const soundOn = useSettingsStore.getState().soundEnabled;
+      if (pendingMessages.length === 0) return;
 
-        // 批量添加消息（减少单次操作数）
-        for (const msg of pendingMessages) {
-          messageStore.addReceived(msg);
-          sessionStore.incrementUnread(msg.session_id);
+      const messageStore = useMessagesStore.getState();
+      const sessionStore = useSessionsStore.getState();
+      const sessions = sessionStore.sessions;
+      const soundOn = useSettingsStore.getState().soundEnabled;
+      const batch = pendingMessages;
+      pendingMessages = [];
 
-          // 查找会话类型以差异化反馈
-          const session = sessions.find((s) => s.session_id === msg.session_id);
-          const isPrivate = session?.type === 'private';
-
-          if (isPrivate) {
-            // 私聊：强反馈（脉冲 + 音效 + 闪烁）
-            if (soundOn && !document.hasFocus()) playMessageSound();
-            if (!document.hasFocus()) {
-              window.api.invoke('window:flash').catch(() => {});
-            }
-            document.body.classList.add('pulse-border');
-            setTimeout(() => document.body.classList.remove('pulse-border'), 1200);
-          }
-          // 群聊：仅未读指示器呼吸灯（incrementUnread 已处理，CSS .sb-unread 自带呼吸动画）
-        }
-        pendingMessages = [];
+      // 历史同步消息：只入库，不涨未读、不响提示
+      const live = [];
+      for (const msg of batch) {
+        messageStore.addReceived(msg);
+        if (msg.source === 'history') continue;
+        live.push(msg);
+        sessionStore.incrementUnread(msg.session_id);
       }
 
-      // 批量更新未读计数
-      if (pendingSessionCounts.size > 0) {
-        const sessionStore = useSessionsStore.getState();
-        for (const [sid, count] of pendingSessionCounts.entries()) {
-          sessionStore.incrementUnread(sid);
+      // 私聊强反馈：本批最多触发一次，避免历史/刷屏时连闪
+      const hasPrivateLive = live.some((msg) => {
+        const session = sessions.find((s) => s.session_id === msg.session_id);
+        return session?.type === 'private';
+      });
+      if (hasPrivateLive) {
+        if (soundOn && !document.hasFocus()) playMessageSound();
+        if (!document.hasFocus()) {
+          window.api.invoke('window:flash').catch(() => {});
         }
-        pendingSessionCounts.clear();
+        document.body.classList.add('pulse-border');
+        setTimeout(() => document.body.classList.remove('pulse-border'), 1200);
       }
     };
 
     unsubs.push(
       window.api.on('message:received', (msg) => {
         pendingMessages.push(msg);
-        pendingSessionCounts.set(msg.session_id, (pendingSessionCounts.get(msg.session_id) || 0) + 1);
-
         if (!rafScheduled) {
           rafScheduled = true;
           requestAnimationFrame(flushUpdates);

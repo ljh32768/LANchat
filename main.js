@@ -2,7 +2,8 @@
 const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { init, registerIpcHandlers } = require('./pages/src/main/ipc');
+const { init, registerIpcHandlers, net, addAuthorizedFilePath } = require('./pages/src/main/ipc');
+const db = require('./pages/src/main/db/database');
 
 const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production';
 
@@ -35,11 +36,13 @@ function createWindow() {
     height: 760,
     minWidth: 880,
     minHeight: 600,
-    frame: false,          // 无边框，自绘异形视窗
-    transparent: true,     // 透明背景，CSS 绘制胶囊/椭圆区域
+    frame: false,          // 无边框，自绘标准矩形标题栏
+    transparent: false,     // 不透明背景，标准矩形窗口
+    thickFrame: false,      // 移除 Windows WS_THICKFRAME resize 边框，内容区填满物理窗口
+    hasShadow: false,       // 禁用 DWM 系统窗口阴影，消除隐形边界
     resizable: true,
     show: false,
-    backgroundColor: '#00000000',
+    backgroundColor: '#FFFFFF',
     titleBarStyle: 'hidden',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -47,7 +50,7 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true
       },
-    icon:'./内部消息_32x32.ico'
+    icon: path.join(__dirname, 'icon.ico')
   });
 
   // 开发环境加载 Vite dev server，生产环境加载打包后的 index.html
@@ -80,13 +83,13 @@ function createWindow() {
     return { action: 'deny' };
   });
 
-  // V26：生产环境拦截 DevTools 快捷键（F12 / Ctrl+Shift+I / Ctrl+R / Ctrl+J）
+  // V26：生产环境拦截 DevTools 快捷键（F12 / Ctrl+Shift+I / Ctrl+J）
+  // 保留 Ctrl+R 供崩溃后恢复使用
   if (!isDev) {
     mainWindow.webContents.on('before-input-event', (event, input) => {
       if (
         input.key === 'F12' ||
         (input.control && input.shift && (input.key === 'I' || input.key === 'i')) ||
-        (input.control && (input.key === 'R' || input.key === 'r')) ||
         (input.control && (input.key === 'J' || input.key === 'j'))
       ) {
         event.preventDefault();
@@ -135,6 +138,8 @@ if (!gotTheLock) {
         filters: [{ name: '所有文件', extensions: ['*'] }]
       });
       if (result.canceled || result.filePaths.length === 0) return null;
+      // 授权路径：file:upload 只接受通过对话框选择的路径
+      addAuthorizedFilePath(result.filePaths[0]);
       return result.filePaths[0];
     });
     // 初始化数据库与网络（mainWindow 就绪后）
@@ -150,4 +155,10 @@ if (!gotTheLock) {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+// 退出前强制落盘 + 清理网络资源（防抖 500ms 内的写入不会丢失）
+app.on('before-quit', () => {
+  try { db.persistNow(); } catch {}
+  try { net.stop(); } catch {}
 });

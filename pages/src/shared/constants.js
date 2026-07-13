@@ -62,6 +62,7 @@ const IPC = {
   FILE_DOWNLOAD: 'file:download',
   FILE_RESUME: 'file:resume',
   FILE_LIST: 'file:list',
+  FILE_LIST_SESSION: 'file:list-session',
   // 网络 / 发现
   NETWORK_GET_DISCOVERED: 'network:get-discovered',
   // 设置

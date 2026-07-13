@@ -1,103 +1,35 @@
-/* ===== 动效定义 ===== */
+/* ===== 动效定义（谷歌极简，克制） ===== */
 
-/* 全息边框呼吸 */
-@keyframes borderBreath {
-  0%, 100% { box-shadow: inset 0 0 25px rgba(0, 229, 255, 0.14), 0 0 0 1px rgba(0,229,255,0.05); }
-  50%      { box-shadow: inset 0 0 45px rgba(0, 229, 255, 0.30), 0 0 0 1px rgba(0,229,255,0.12); }
-}
-
-/* 扫描线漂移 */
-@keyframes scanlineDrift {
-  0%   { background-position: 0 0; }
-  100% { background-position: 0 100px; }
-}
-
-/* 新消息到达：边框脉冲 */
-body.pulse-border .app-shell {
-  animation: msgPulse 1.2s ease-out;
-}
-@keyframes msgPulse {
-  0%   { box-shadow: 0 0 22px rgba(0,229,255,0.25), 0 0 60px rgba(0,120,200,0.15); }
-  20%  { box-shadow: 0 0 40px rgba(255,138,61,0.6), 0 0 90px rgba(255,138,61,0.35); border-color: rgba(255,138,61,0.7); }
-  100% { box-shadow: 0 0 22px rgba(0,229,255,0.25), 0 0 60px rgba(0,120,200,0.15); }
-}
-
-/* 消息气泡进入 + 扫描打印 */
+/* 消息气泡进入 */
 @keyframes bubbleIn {
-  from { opacity: 0; transform: translateY(8px); }
+  from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: translateY(0); }
 }
 .msg-bubble {
-  animation: bubbleIn 0.32s ease-out;
+  animation: bubbleIn 0.18s ease-out;
 }
 
-/* 文字逐行打印效果（用 background-clip 模拟扫描） */
-.msg-text {
-  background: linear-gradient(180deg, transparent 0%, rgba(0,229,255,0.08) 50%, transparent 100%);
-  background-size: 100% 4px;
-  background-repeat: repeat-y;
-  animation: textScan 1.2s ease-out;
-}
-@keyframes textScan {
-  from { background-position: 0 -100%; }
-  to   { background-position: 0 100%; }
-}
-
-/* 启动 spinner */
+/* 启动 spinner（Material 风格细环） */
 @keyframes spin { to { transform: rotate(360deg); } }
 .boot-spinner {
-  width: 46px; height: 46px;
-  border: 2px solid rgba(0, 229, 255, 0.18);
-  border-top-color: var(--neon-blue);
-  border-right-color: var(--neon-cyan);
+  width: 40px; height: 40px;
+  border: 2px solid #E8EAED;
+  border-top-color: var(--primary);
   border-radius: 50%;
-  animation: spin 0.9s linear infinite;
+  animation: spin 0.8s linear infinite;
   margin: 18px auto;
-  box-shadow: 0 0 18px rgba(0,229,255,0.4);
 }
-
-/* 在线指示呼吸 */
-@keyframes dotBreath {
-  0%, 100% { box-shadow: 0 0 4px rgba(73,255,176,0.6); }
-  50%      { box-shadow: 0 0 10px rgba(73,255,176,1); }
-}
-.sb-dot.on { animation: dotBreath 2s ease-in-out infinite; }
-
-/* 未读计数呼吸 */
-@keyframes unreadGlow {
-  0%, 100% { box-shadow: 0 0 6px rgba(255,138,61,0.6); }
-  50%      { box-shadow: 0 0 14px rgba(255,138,61,1); }
-}
-.sb-unread { animation: unreadGlow 1.6s ease-in-out infinite; }
-
-/* 输入框光迹 */
-@keyframes inputGlow {
-  0%, 100% { box-shadow: 0 0 8px rgba(0,229,255,0.15), inset 0 0 6px rgba(0,229,255,0.08); }
-  50%      { box-shadow: 0 0 16px rgba(0,229,255,0.35), inset 0 0 10px rgba(0,229,255,0.15); }
-}
-.mi-text:focus { animation: inputGlow 2.4s ease-in-out infinite; }
 
 /* 登录卡片进入 */
 @keyframes cardIn {
-  from { opacity: 0; transform: translateY(20px) scale(0.97); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
-.login-card { animation: cardIn 0.6s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.login-card { animation: cardIn 0.4s ease-out; }
 
 /* 模态进入 */
 @keyframes modalIn {
-  from { opacity: 0; transform: translateY(12px) scale(0.96); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
-.modal-card { animation: modalIn 0.28s ease-out; }
-
-/* 渐变流动（标题装饰条） */
-@keyframes flowMove {
-  0% { background-position: 0% 50%; }
-  100% { background-position: 200% 50%; }
-}
-.flow-bar {
-  background: linear-gradient(90deg, transparent, var(--neon-blue), var(--neon-cyan), var(--neon-blue), transparent);
-  background-size: 200% 100%;
-  animation: flowMove 3s linear infinite;
-}
+.modal-card { animation: modalIn 0.2s ease-out; }

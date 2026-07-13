@@ -66,11 +66,29 @@ function getLocalIp() {
   return list[0].address;
 }
 
-// 按行（\n）拆分缓冲区，用于 TCP 帧拆包
+// 规范化 IP：去掉 IPv4 映射前缀 ::ffff:，便于与 peers 中的 IPv4 比较
+function normalizeIp(ip) {
+  if (!ip || typeof ip !== 'string') return '';
+  const s = ip.trim().toLowerCase();
+  if (s.startsWith('::ffff:')) return s.slice(7);
+  return s;
+}
+
+// 按行（\n）拆分缓冲区，用于 TCP 帧拆包；限制未完成行长度，防内存膨胀
+const MAX_LINE_BUFFER = 1024 * 1024; // 1MB
 class LineBuffer {
-  constructor() { this.buf = ''; }
+  constructor(maxBytes = MAX_LINE_BUFFER) {
+    this.buf = '';
+    this.maxBytes = maxBytes;
+    this.overflow = false;
+  }
   push(chunk) {
     this.buf += chunk.toString('utf8');
+    if (this.buf.length > this.maxBytes) {
+      this.overflow = true;
+      this.buf = '';
+      return [];
+    }
     const lines = this.buf.split('\n');
     this.buf = lines.pop();
     return lines;
@@ -202,6 +220,7 @@ class NetworkManager extends EventEmitter {
         client_id: this.clientInfo.client_id,
         nickname: this.clientInfo.nickname,
         ip: this.localIp,
+        file_port: this.fileServerPort,
         sessions: Array.from(this.hosted.values())
           .filter((h) => h.session.type !== 'private') // 私聊不广播到局域网
           .map((h) => ({
@@ -210,7 +229,8 @@ class NetworkManager extends EventEmitter {
             type: h.session.type,
             host_contact_id: h.session.host_contact_id,
             member_count: h.members.size + 1,
-            message_port: h.port
+            message_port: h.port,
+            file_port: this.fileServerPort
           }))
       };
     }
@@ -276,11 +296,18 @@ class NetworkManager extends EventEmitter {
         ip: finalIp,
         last_seen: Date.now()
       });
+      const peerFilePort = packet.file_port || TCP_FILE_PORT_BASE;
+      // 记录该 peer 的文件端口，供上传/下载使用（避免硬编码 47890）
+      const peerRec = this.peers.get(packet.client_id);
+      if (peerRec) peerRec.file_port = peerFilePort;
+
       for (const s of packet.sessions || []) {
         const existingSession = this.discoveredSessions.get(s.session_id);
+        const filePort = s.file_port || peerFilePort || TCP_FILE_PORT_BASE;
         this.discoveredSessions.set(s.session_id, {
           ...s,
           host_ip: finalIp,
+          file_port: filePort,
           last_seen: Date.now()
         });
         if (!existingSession) {
@@ -291,17 +318,26 @@ class NetworkManager extends EventEmitter {
             host_ip: finalIp,
             host_contact_id: s.host_contact_id,
             member_count: s.member_count,
-            message_port: s.message_port
+            message_port: s.message_port,
+            file_port: filePort
           });
         } else {
           this.emit('presence-update', {
             session_id: s.session_id,
-            member_count: s.member_count
+            member_count: s.member_count,
+            file_port: filePort
           });
         }
       }
       this.emit('peer-online', this.peers.get(packet.client_id));
     } else if (packet.type === PACKET.SESSION_END) {
+      // 仅清理发现列表；真正结束会话以 TCP session-end / 本地 close 为准
+      // 若能校验到发送者是该会话主机则更佳，未知 host 时仍删发现项（兼容旧行为）
+      const disc = this.discoveredSessions.get(packet.session_id);
+      if (disc && disc.host_contact_id && packet.client_id && disc.host_contact_id !== packet.client_id) {
+        console.warn('[net] ignore session_end from non-host', packet.client_id.slice(0, 8), 'sid', packet.session_id.slice(0, 8));
+        return;
+      }
       this.discoveredSessions.delete(packet.session_id);
       this.emit('session-removed', { session_id: packet.session_id });
     } else if (packet.type === PACKET.PRIVATE_INVITE) {
@@ -324,6 +360,7 @@ class NetworkManager extends EventEmitter {
           session_name: packet.session_name,
           host_ip: rinfo.address,
           message_port: packet.message_port,
+          file_port: packet.file_port || TCP_FILE_PORT_BASE,
           from: packet.from
         });
       }
@@ -345,7 +382,8 @@ class NetworkManager extends EventEmitter {
       session_id: invite.session_id,
       session_name: invite.session_name,
       host_ip: this.localIp,
-      message_port: invite.message_port
+      message_port: invite.message_port,
+      file_port: this.fileServerPort
     };
     const msg = Buffer.from(JSON.stringify(packet));
     console.log('[net] sendPrivateInvite to', targetIp, 'host_ip', this.localIp, 'port', invite.message_port, 'sid', invite.session_id.slice(0, 8));
@@ -460,19 +498,26 @@ class NetworkManager extends EventEmitter {
 
   _onHostSocket(socket, sessionId) {
     const lb = new LineBuffer();
-    // 记录对端 IP 用于身份绑定校验（V3：防 client_id 冒充）
-    const memberInfo = { client_id: null, nickname: null, socket, remoteAddress: socket.remoteAddress };
+    // 记录对端 IP 用于身份绑定校验（V3：防 client_id 冒充）；统一规范化 IPv4 映射地址
+    const remoteAddress = normalizeIp(socket.remoteAddress);
+    const memberInfo = { client_id: null, nickname: null, socket, remoteAddress };
     // V5：TCP keep-alive + 超时 + 禁用 Nagle
     socket.setKeepAlive(true, 30000);
     socket.setNoDelay(true);
     // 空闲超时设为 300s（大文件传输时会话连接可能长时间无消息，60s 过短）
     socket.setTimeout(300000);
     socket.on('timeout', () => {
-      console.warn('[net] host socket idle timeout, destroy', socket.remoteAddress);
+      console.warn('[net] host socket idle timeout, destroy', remoteAddress);
       socket.destroy();
     });
     socket.on('data', (chunk) => {
-      for (const line of lb.push(chunk)) {
+      const lines = lb.push(chunk);
+      if (lb.overflow) {
+        console.warn('[net] host line buffer overflow, destroy', remoteAddress);
+        socket.destroy();
+        return;
+      }
+      for (const line of lines) {
         try { this._onHostLine(line, socket, sessionId, memberInfo); } catch (e) { console.error(e); }
       }
     });
@@ -484,9 +529,11 @@ class NetworkManager extends EventEmitter {
     const msg = JSON.parse(line);
     if (msg.kind === 'join') {
       // V3：校验 client_id 与对端 IP 是否与 peers 中登记的一致（防冒充）
+      // 比较前 normalize，避免 ::ffff:192.168.x.x 与 192.168.x.x 误拒
       const peer = this.peers.get(msg.client_id);
-      if (peer && peer.ip && peer.ip !== socket.remoteAddress) {
-        console.warn('[net] join rejected: client_id IP mismatch', msg.client_id.slice(0, 8), 'peer.ip=', peer.ip, 'socket=', socket.remoteAddress);
+      const peerIp = peer ? normalizeIp(peer.ip) : '';
+      if (peer && peerIp && peerIp !== memberInfo.remoteAddress) {
+        console.warn('[net] join rejected: client_id IP mismatch', msg.client_id.slice(0, 8), 'peer.ip=', peer.ip, 'socket=', memberInfo.remoteAddress);
         socket.destroy();
         return;
       }
@@ -584,16 +631,19 @@ class NetworkManager extends EventEmitter {
 
   // ---- 成员：加入会话 ----
   // 网络抖动时自动重连（最多 5 次，间隔 2s），只在主机明确解散（session-end）时才结束
-  joinSession(sessionId, hostIp, hostPort, onMessage) {
+  // options.file_port：主机文件服务端口（可从 presence 获取）
+  joinSession(sessionId, hostIp, hostPort, onMessage, options = {}) {
     if (this.joined.has(sessionId)) return;
     console.log('[net] joinSession connecting to', hostIp + ':' + hostPort, 'sid', sessionId.slice(0, 8));
     const socket = net.createConnection({ host: hostIp, port: hostPort });
     const lb = new LineBuffer();
+    const disc = this.discoveredSessions.get(sessionId);
     const ctx = {
       socket,
       lineBuffer: lb,
       host_ip: hostIp,
       host_port: hostPort,
+      file_port: options.file_port || disc?.file_port || TCP_FILE_PORT_BASE,
       onMessage,
       reconnectAttempts: 0,
       ended: false, // 主机明确解散后才置 true，阻止重连
@@ -620,23 +670,30 @@ class NetworkManager extends EventEmitter {
       this._startHeartbeat(sessionId);
     });
     socket.on('data', (chunk) => {
-      for (const line of lb.push(chunk)) {
+      const lines = lb.push(chunk);
+      if (lb.overflow) {
+        console.warn('[net] join line buffer overflow, destroy', sessionId.slice(0, 8));
+        socket.destroy();
+        return;
+      }
+      for (const line of lines) {
         try {
           const msg = JSON.parse(line);
           if (msg.kind === 'joined') {
             this.emit('joined', { session_id: sessionId, members: msg.members });
           } else if (msg.kind === 'session-end') {
-            // 主机明确解散：标记结束，不再重连
+            // 主机明确解散：标记结束，不再重连；发出 session-ended 供 UI 真正结束
             console.log('[net] recv session-end from host, stopping', sessionId.slice(0, 8));
             ctx.ended = true;
+            this.emit('session-ended', { session_id: sessionId });
             this.emit('session-removed', { session_id: sessionId });
           } else if (msg.kind === 'pong') {
             // 心跳响应：重置未响应计数
             ctx.missedPongs = 0;
           } else if (msg.kind === 'history') {
-            // 主机推送的历史消息：逐条交给上层（db.addMessage 幂等，已存在会跳过）
+            // 主机推送的历史消息：标记 source=history，上层不计未读
             for (const m of (msg.messages || [])) {
-              try { onMessage(m); } catch (e) { console.error('[net] history item error:', e); }
+              try { onMessage({ ...m, source: 'history' }); } catch (e) { console.error('[net] history item error:', e); }
             }
           } else if (msg.kind === 'msg' || msg.kind === 'file') {
             onMessage(msg);
@@ -674,15 +731,16 @@ class NetworkManager extends EventEmitter {
         this._stopHeartbeat(sessionId);
         return;
       }
+      // 先发 ping 再检查未响应计数（避免首个周期未等 pong 已计 1）
+      try { this._sendJson(ctx.socket, { kind: 'ping' }); } catch {}
       ctx.missedPongs++;
       if (ctx.missedPongs >= 3) {
         console.warn('[net] heartbeat: 3 pongs missed, host likely offline, reconnect', sessionId.slice(0, 8));
         this._stopHeartbeat(sessionId);
         try { ctx.socket.destroy(); } catch {}
-        // 触发 end 事件 → _reconnectJoined
+        // 触发 close 事件 → _reconnectJoined
         return;
       }
-      try { this._sendJson(ctx.socket, { kind: 'ping' }); } catch {}
     }, 30000);
   }
 
@@ -744,12 +802,13 @@ class NetworkManager extends EventEmitter {
             } else if (msg.kind === 'session-end') {
               ctx.ended = true;
               this._stopHeartbeat(sessionId);
+              this.emit('session-ended', { session_id: sessionId });
               this.emit('session-removed', { session_id: sessionId });
             } else if (msg.kind === 'pong') {
               ctx.missedPongs = 0;
             } else if (msg.kind === 'history') {
               for (const m of (msg.messages || [])) {
-                try { ctx.onMessage(m); } catch (e) { console.error('[net] history item error:', e); }
+                try { ctx.onMessage({ ...m, source: 'history' }); } catch (e) { console.error('[net] history item error:', e); }
               }
             } else if (msg.kind === 'msg' || msg.kind === 'file') {
               ctx.onMessage(msg);
@@ -1005,6 +1064,20 @@ class NetworkManager extends EventEmitter {
     stream.pipe(socket);
   }
 
+  // 解析主机文件端口：优先会话发现记录，其次 peers 上的 file_port，最后本机默认
+  getHostFilePort(sessionId, hostIp) {
+    const disc = this.discoveredSessions.get(sessionId);
+    if (disc && disc.file_port) return disc.file_port;
+    if (hostIp) {
+      for (const p of this.peers.values()) {
+        if (normalizeIp(p.ip) === normalizeIp(hostIp) && p.file_port) return p.file_port;
+      }
+    }
+    const joined = this.joined.get(sessionId);
+    if (joined && joined.file_port) return joined.file_port;
+    return this.fileServerPort || TCP_FILE_PORT_BASE;
+  }
+
   // 成员上传文件到主机暂存（头部 + 原始字节）
   // 阶段1-4：异步队列 + 动态缓冲 + 双重完成检测 + 自动重试（最多 2 次）
   uploadFileToHost(sessionId, { file_id, file_name, file_size, file_path }, cb) {
@@ -1014,9 +1087,10 @@ class NetworkManager extends EventEmitter {
     this._enqueueFileTransfer(() => {
       let attempt = 0;
       const maxAttempts = 2;
+      const hostFilePort = this.getHostFilePort(sessionId, ctx.host_ip);
 
       const tryUpload = () => {
-        const sock = net.createConnection({ host: ctx.host_ip, port: this.fileServerPort });
+        const sock = net.createConnection({ host: ctx.host_ip, port: hostFilePort });
         this._tuneFileSocket(sock, file_size);
         let called = false;
         let gotUploadDone = false; // 阶段3：状态追踪，主机是否发来 upload-done 确认
@@ -1200,8 +1274,8 @@ class NetworkManager extends EventEmitter {
     let active = N;
     let firstError = null;
     const partState = partRanges.map((r) => ({ part_id: r.part_id, received: r.received || 0, done: false, err: null }));
-    // 单文件内部并行：直接占用 N 个并发槽位（绕过 _enqueueFileTransfer 队列）
-    this._activeFileTransfers += N;
+    // 单文件并行下载计入 1 个全局并发槽位（而非 N 个），避免多文件同时下载时连接暴涨
+    this._activeFileTransfers += 1;
 
     const finishOne = (idx, err) => {
       if (partState[idx].done) return;
@@ -1210,7 +1284,7 @@ class NetworkManager extends EventEmitter {
       if (err && !firstError) firstError = err;
       active--;
       if (active === 0) {
-        this._activeFileTransfers -= N;
+        this._activeFileTransfers -= 1;
         // 拉起排队任务
         while (this._activeFileTransfers < this._maxFileTransfers && this._fileTransferQueue.length > 0) {
           this._activeFileTransfers++;
@@ -1319,4 +1393,4 @@ class NetworkManager extends EventEmitter {
   }
 }
 
-module.exports = { NetworkManager, getLocalIp };
+module.exports = { NetworkManager, getLocalIp, normalizeIp };

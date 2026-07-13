@@ -22,8 +22,8 @@ export default function Sidebar({ onNewSession }) {
   const clientId = useClientStore((s) => s.clientId);
 
   const openSession = async (sid) => {
-    setActive(sid);
     await loadMessages(sid);
+    setActive(sid);
   };
 
   const handleJoin = async (s) => {

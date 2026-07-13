@@ -14,6 +14,22 @@ function formatSize(bytes) {
   return (bytes / 1024 / 1024).toFixed(2) + ' MB';
 }
 
+function getFileIcon(fileName) {
+  if (!fileName) return '📎';
+  const ext = fileName.split('.').pop().toLowerCase();
+  const map = {
+    pdf: '📄', doc: '📘', docx: '📘', txt: '📄',
+    jpg: '🖼️', jpeg: '🖼️', png: '🖼️', gif: '🖼️', bmp: '🖼️', webp: '🖼️', svg: '🖼️',
+    zip: '🗜️', rar: '🗜️', '7z': '🗜️', gz: '🗜️', tar: '🗜️',
+    exe: '⚙️', msi: '⚙️', bat: '⚙️',
+    mp3: '🎵', wav: '🎵', flac: '🎵',
+    mp4: '🎬', avi: '🎬', mkv: '🎬', mov: '🎬',
+    xls: '📊', xlsx: '📊', csv: '📊',
+    ppt: '📽️', pptx: '📽️',
+  };
+  return map[ext] || '📎';
+}
+
 export default function MessageBubble({ message, isSelf, clientId, contacts, peers, hostIp, filePort, ended }) {
   const download = useFilesStore((s) => s.download);
   const resume = useFilesStore((s) => s.resume);
@@ -63,38 +79,56 @@ export default function MessageBubble({ message, isSelf, clientId, contacts, pee
 
 function FileCard({ meta, isSelf, ended, onDownload, onResume }) {
   const progress = useFilesStore((s) => s.progress[meta.file_id] ?? null);
-  // 仅发送方（isSelf）本机拥有原文件 → completed；主机作为接收方仍需下载
   const status = useFilesStore((s) => s.status[meta.file_id] ?? (isSelf ? 'completed' : 'pending'));
+  const isEmpty = !meta.file_size || meta.file_size === 0;
 
   return (
     <div className="file-card">
-      <div className="file-icon">▮</div>
+      <div className="file-icon">{getFileIcon(meta.file_name)}</div>
       <div className="file-info">
         <div className="file-name" title={meta.file_name}>{meta.file_name}</div>
         <div className="file-size">{formatSize(meta.file_size)}</div>
-        {status === 'downloading' && progress != null && (
-          <div className="file-progress">
-            <div className="file-progress-bar" style={{ width: Math.round(progress * 100) + '%' }} />
-            <span>{Math.round(progress * 100)}%</span>
-          </div>
-        )}
         {status === 'failed' && <div className="file-failed">下载失败</div>}
       </div>
       <div className="file-action">
-        {isSelf ? (
-          <span className="file-done">已暂存</span>
+        {isEmpty ? (
+          <span className="file-unavail">空文件</span>
+        ) : isSelf ? (
+          <span className="file-done">✓ 已暂存</span>
         ) : status === 'completed' ? (
-          <span className="file-done">已下载</span>
+          <span className="file-done">✓ 已下载</span>
         ) : status === 'downloading' ? (
-          <span className="file-busy">传输中</span>
+          <FileRing progress={progress} />
         ) : status === 'failed' ? (
-          <button className="file-dl-btn" onClick={onResume}>续传</button>
+          <button className="file-dl-btn" onClick={onResume}>↻ 重试</button>
         ) : ended ? (
           <span className="file-unavail">不可用</span>
         ) : (
           <button className="file-dl-btn" onClick={onDownload}>下载</button>
         )}
       </div>
+    </div>
+  );
+}
+
+function FileRing({ progress }) {
+  const p = Math.round((progress ?? 0) * 100);
+  const r = 11;
+  const c = 2 * Math.PI * r;
+  const offset = c * (1 - (progress ?? 0));
+  return (
+    <div className="file-ring" title={p + '%'}>
+      <svg width="28" height="28" viewBox="0 0 28 28">
+        <circle cx="14" cy="14" r={r} fill="none" stroke="#E8EAED" strokeWidth="3" />
+        <circle
+          cx="14" cy="14" r={r} fill="none" stroke="var(--primary)" strokeWidth="3"
+          strokeLinecap="round"
+          strokeDasharray={c}
+          strokeDashoffset={offset}
+          transform="rotate(-90 14 14)"
+        />
+      </svg>
+      <span className="file-ring-pct">{p}%</span>
     </div>
   );
 }

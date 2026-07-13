@@ -59,6 +59,28 @@ export const useFilesStore = create(
 
     setFailed: (fileId) => {
       set((state) => ({ status: { ...state.status, [fileId]: 'failed' } }));
+    },
+
+    // 从 DB 恢复文件状态（打开会话时调用，避免重启后状态丢失）
+    loadSessionFiles: async (sessionId) => {
+      try {
+        const files = await window.api.invoke('file:list-session', sessionId);
+        if (!files || files.length === 0) return;
+        set((state) => {
+          const status = { ...state.status };
+          const storagePath = { ...state.storagePath };
+          for (const f of files) {
+            // 仅恢复非临时状态（completed/failed），不覆盖正在进行的下载
+            if (f.download_status === 'completed' || f.download_status === 'failed') {
+              if (!status[f.file_id] || status[f.file_id] === 'pending') {
+                status[f.file_id] = f.download_status;
+                if (f.storage_path) storagePath[f.file_id] = f.storage_path;
+              }
+            }
+          }
+          return { status, storagePath };
+        });
+      } catch {}
     }
   }))
 );

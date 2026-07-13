@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { useClientStore } from '../stores/useClientStore';
 import { useSettingsStore } from '../stores/useSettingsStore';
+import { useSessionsStore } from '../stores/useSessionsStore';
+import { useMessagesStore } from '../stores/useMessagesStore';
 
 export default function SettingsPanel({ onClose }) {
   const nickname = useClientStore((s) => s.nickname);
@@ -75,6 +77,9 @@ export default function SettingsPanel({ onClose }) {
                   if (!confirm('确认清理 30 天前的消息？此操作不可撤销。')) return;
                   try {
                     await window.api.invoke('db:cleanup', { days: 30 });
+                    // 刷新会话列表和消息，清理 UI 残留
+                    await useSessionsStore.getState().load();
+                    useMessagesStore.setState({ messagesBySession: {}, loadedSessions: new Set() });
                     alert('清理完成');
                   } catch (e) {
                     alert('清理失败: ' + e.message);

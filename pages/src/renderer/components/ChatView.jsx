@@ -1,19 +1,18 @@
-import { useEffect, useRef, useState } from 'react';
-import { FixedSizeList as List } from 'react-window';
+import { useEffect, useRef } from 'react';
 import { SESSION_STATUS } from '../constants';
 import { useSessionsStore } from '../stores/useSessionsStore';
 import { useMessagesStore } from '../stores/useMessagesStore';
 import { useClientStore } from '../stores/useClientStore';
 import { useContactsStore } from '../stores/useContactsStore';
+import { useFilesStore } from '../stores/useFilesStore';
 import MessageBubble from './MessageBubble';
 import MessageInput from './MessageInput';
 
-// 文件传输固定端口（与 shared/constants 的 TCP_FILE_PORT_BASE 一致）
-const FILE_PORT = 47890;
-// 稳定引用的空数组，避免 useSyncExternalStore 的 getSnapshot 无限循环
+// 文件传输默认端口（与 shared/constants 的 TCP_FILE_PORT_BASE 一致）
+// 实际使用时优先从 discovered session 的 file_port 获取
+const DEFAULT_FILE_PORT = 47890;
+// 稳定引用的空数组，避免 selector 在消息未加载时每次渲染创建新引用导致无限重渲染
 const EMPTY_MESSAGES = [];
-// V14：虚拟列表固定行高
-const ITEM_HEIGHT = 80;
 
 export default function ChatView() {
   const activeSessionId = useSessionsStore((s) => s.activeSessionId);
@@ -29,29 +28,22 @@ export default function ChatView() {
   const contacts = useContactsStore((s) => s.contacts);
   const peers = useContactsStore((s) => s.peers);
   const scrollRef = useRef(null);
-  const listRef = useRef(null);
-  const [containerHeight, setContainerHeight] = useState(400);
 
   const session = sessions.find((s) => s.session_id === activeSessionId);
 
-  // V14：测量容器高度供 FixedSizeList 使用
+  // 自动滚动到底部（原生滚动，无虚拟列表双重渲染）
   useEffect(() => {
-    if (!scrollRef.current) return;
-    const updateHeight = () => {
-      if (scrollRef.current) setContainerHeight(scrollRef.current.clientHeight);
-    };
-    updateHeight();
-    const observer = new ResizeObserver(updateHeight);
-    observer.observe(scrollRef.current);
-    return () => observer.disconnect();
-  }, []);
-
-  // V14：自动滚动到底部（虚拟列表用 scrollToItem）
-  useEffect(() => {
-    if (listRef.current && messages.length > 0) {
-      listRef.current.scrollToItem(messages.length - 1, 'end');
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages.length, activeSessionId]);
+
+  // 切换会话时从 DB 恢复文件状态（避免重启后状态丢失）
+  useEffect(() => {
+    if (activeSessionId) {
+      useFilesStore.getState().loadSessionFiles(activeSessionId);
+    }
+  }, [activeSessionId]);
 
   if (!session) {
     return (
@@ -70,25 +62,8 @@ export default function ChatView() {
   const hostInfo = discovered.find((d) => d.session_id === session.session_id);
   // 主机不在自己的 discovered 列表中，下载文件时回退使用本机 IP
   const hostIp = hostInfo?.host_ip || (isHost ? selfIp : undefined);
-
-  // V14：虚拟列表行渲染器
-  const renderRow = ({ index, style }) => {
-    const m = messages[index];
-    return (
-      <div style={{ ...style, overflow: 'hidden' }}>
-        <MessageBubble
-          message={m}
-          isSelf={m.sender_contact_id === 'self' || m.sender_contact_id === clientId}
-          clientId={clientId}
-          contacts={contacts}
-          peers={peers}
-          hostIp={hostIp}
-          filePort={FILE_PORT}
-          ended={ended}
-        />
-      </div>
-    );
-  };
+  // 文件端口：优先从 discovered session 获取，主机回退到默认端口
+  const filePort = hostInfo?.file_port || DEFAULT_FILE_PORT;
 
   return (
     <main className="chat-view">
@@ -111,17 +86,22 @@ export default function ChatView() {
 
       <div className="chat-messages" ref={scrollRef}>
         {messages.length === 0 && <div className="chat-empty-msg">暂无消息，发送第一条讯息吧。</div>}
-        {messages.length > 0 && (
-          <List
-            height={containerHeight}
-            itemCount={messages.length}
-            itemSize={ITEM_HEIGHT}
-            width="100%"
-            ref={listRef}
-          >
-            {renderRow}
-          </List>
-        )}
+        {messages.map((m) => {
+          const isSelf = m.sender_contact_id === 'self' || m.sender_contact_id === clientId;
+          return (
+            <MessageBubble
+              key={m.message_id}
+              message={m}
+              isSelf={isSelf}
+              clientId={clientId}
+              contacts={contacts}
+              peers={peers}
+              hostIp={hostIp}
+              filePort={filePort}
+              ended={ended}
+            />
+          );
+        })}
       </div>
 
       <MessageInput sessionId={session.session_id} disabled={ended} />

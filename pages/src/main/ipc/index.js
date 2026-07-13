@@ -18,12 +18,25 @@ const net = new NetworkManager();
 let mainWindow = null;
 let initialized = false;
 
+// 文件路径授权白名单：dialog:open-file 选择后授权，file:upload 消费后移除（一次性）
+const authorizedFilePaths = new Set();
+function addAuthorizedFilePath(p) { if (p) authorizedFilePaths.add(p); }
+
 // V14：消息速率限制（10 msg/sec）与消息队列
+// 滑动窗口限速：1000ms 窗口内最多 MAX_MSG_PER_SEC 条
 const MAX_MSG_PER_SEC = 10;
 const MSG_QUEUE_SIZE = 100;
-const messageQueue = new Map(); // file_id -> { queue: [], lastTs, currentMsg }
+const MSG_RATE_WINDOW_MS = 1000;
+const MSG_RATE_INTERVAL_MS = Math.ceil(MSG_RATE_WINDOW_MS / MAX_MSG_PER_SEC); // 100ms 间隔
+const MAX_MSG_CONTENT_LEN = 16 * 1024; // 16KB
+const messageQueue = new Map(); // queueKey -> { queue: [], recentTs: [], currentMsg: null }
 
 function enqueueMessage(session_id, content, type) {
+  // 内容长度校验
+  if (typeof content === 'string' && content.length > MAX_MSG_CONTENT_LEN) {
+    return { error: '消息内容过长（上限 16KB）' };
+  }
+
   const client = db.getClientInfo();
   const message_id = uuidv4();
   const local_id = uuidv4();
@@ -45,24 +58,24 @@ function enqueueMessage(session_id, content, type) {
   let q = messageQueue.get(queueKey);
 
   if (!q) {
-    q = { queue: [], lastTs: timestamp - 1000, currentMsg: null };
+    q = { queue: [], recentTs: [], currentMsg: null };
     messageQueue.set(queueKey, q);
   }
 
   // 如果有消息正在发送，直接排队等待
   if (q.currentMsg) {
     if (q.queue.length >= MSG_QUEUE_SIZE) {
-      // 队列已满，丢弃最早的
-      q.queue.shift();
+      q.queue.shift(); // 队列已满，丢弃最早的
     }
     q.queue.push(msg);
     return { message_id, timestamp, local_id };
   }
 
-  // 检查速率限制
-  const timeSinceLastMsg = timestamp - q.lastTs;
-  if (timeSinceLastMsg < 1000) {
-    // 1秒内超过 MAX_MSG_PER_SEC，排队
+  // 滑动窗口限速：清理窗口外的旧时间戳，检查窗口内数量
+  const now = timestamp;
+  q.recentTs = q.recentTs.filter((t) => now - t < MSG_RATE_WINDOW_MS);
+  if (q.recentTs.length >= MAX_MSG_PER_SEC) {
+    // 窗口已满，排队
     if (q.queue.length >= MSG_QUEUE_SIZE) {
       q.queue.shift();
     }
@@ -71,7 +84,7 @@ function enqueueMessage(session_id, content, type) {
   }
 
   // 速率限制通过，立即发送
-  q.lastTs = timestamp;
+  q.recentTs.push(now);
   q.currentMsg = msg;
 
   // 发送方本地存库
@@ -94,11 +107,10 @@ function enqueueMessage(session_id, content, type) {
     }
     q.currentMsg = null;
 
-    // 处理队列中的下一条消息（直接发送，不再经过速率限制，保持原始 message_id）
+    // 处理队列中的下一条消息（按限速间隔发送，保持原始 message_id）
     if (q.queue.length > 0) {
       const nextMsg = q.queue.shift();
-      // 使用 setTimeout 允许事件循环处理其他任务
-      setTimeout(() => flushQueuedMessage(nextMsg, q), 0);
+      setTimeout(() => flushQueuedMessage(nextMsg, q), MSG_RATE_INTERVAL_MS);
     }
   };
 
@@ -106,7 +118,7 @@ function enqueueMessage(session_id, content, type) {
   return { message_id, timestamp, local_id };
 }
 
-// 直接发送队列中的消息（不经过速率限制，保持原始 message_id）
+// 发送队列中的消息（保持原始 message_id，按限速间隔泄洪）
 function flushQueuedMessage(msg, q) {
   // 写入 DB
   db.addMessage({
@@ -126,16 +138,21 @@ function flushQueuedMessage(msg, q) {
     net.memberSend(msg.session_id, msg);
   }
 
-  // 继续处理队列中的下一条
+  // 继续处理队列中的下一条，按限速间隔发送
   if (q && q.queue.length > 0) {
     const nextMsg = q.queue.shift();
-    setTimeout(() => flushQueuedMessage(nextMsg, q), 0);
+    setTimeout(() => flushQueuedMessage(nextMsg, q), MSG_RATE_INTERVAL_MS);
   }
 }
 
 // V13：昵称/名称后端校验（长度上限 + 去除换行/尖括号）
 function sanitizeName(s) {
   return String(s || '').trim().slice(0, 24).replace(/[\r\n<>]/g, '');
+}
+
+// 会话名称校验：放宽到 32 字符，同样去换行/尖括号
+function sanitizeSessionName(s) {
+  return String(s || '').trim().slice(0, 32).replace(/[\r\n<>]/g, '');
 }
 
 function send(channel, data) {
@@ -145,9 +162,11 @@ function send(channel, data) {
 }
 
 // 接收到远端消息（主机收到成员 / 成员收到主机转发）→ 存库 + 推送渲染
-function handleReceivedMessage(msg) {
+// options.source === 'history'：历史同步，仍推渲染入库 UI，但不计未读/不响提示
+function handleReceivedMessage(msg, options = {}) {
   try {
-    // 幂等：若已存在则跳过
+    const source = options.source || msg.source || 'live';
+    // 幂等：若已存在则跳过入库，但仍可能需要补 UI（极少见）；历史路径跳过重复推送
     const existing = db.queryOne('SELECT message_id FROM messages WHERE message_id = ?', [msg.message_id]);
     if (!existing) {
       // upsert 发送者联系人
@@ -189,6 +208,9 @@ function handleReceivedMessage(msg) {
           });
         }
       }
+    } else if (source === 'history') {
+      // 历史中已有记录：无需再推 UI
+      return;
     }
     send(IPC_EVENT.MESSAGE_RECEIVED, {
       message_id: msg.message_id,
@@ -196,7 +218,8 @@ function handleReceivedMessage(msg) {
       sender_contact_id: msg.sender_contact_id,
       content: msg.content,
       type: msg.type,
-      timestamp: msg.timestamp
+      timestamp: msg.timestamp,
+      source
     });
   } catch (e) {
     console.error('[ipc] handleReceivedMessage error:', e);
@@ -206,6 +229,11 @@ function handleReceivedMessage(msg) {
 function registerNetworkEvents() {
   net.on('session-discovered', (info) => send(IPC_EVENT.SESSION_DISCOVERED, info));
   net.on('session-removed', (info) => send(IPC_EVENT.SESSION_REMOVED, info));
+  net.on('session-ended', ({ session_id }) => {
+    // 主机明确解散（TCP session-end）：标记本地会话结束并通知渲染层
+    try { db.closeSession(session_id, Date.now()); } catch {}
+    send(IPC_EVENT.SESSION_ENDED, { session_id, ended_at: Date.now() });
+  });
   net.on('presence-update', (info) => send(IPC_EVENT.PRESENCE_UPDATE, info));
   net.on('message', (msg) => handleReceivedMessage(msg));
   net.on('peer-online', (peer) => {
@@ -273,7 +301,9 @@ function registerNetworkEvents() {
   net.on('private-invite', (invite) => {
     try {
       // 建立 TCP 连接到主机
-      net.joinSession(invite.session_id, invite.host_ip, invite.message_port, (msg) => handleReceivedMessage(msg));
+      net.joinSession(invite.session_id, invite.host_ip, invite.message_port, (msg) => handleReceivedMessage(msg), {
+        file_port: invite.file_port
+      });
       // 本地记录会话
       const existing = db.getSession(invite.session_id);
       if (!existing) {
@@ -352,10 +382,11 @@ function registerIpcHandlers() {
     const client = db.getClientInfo();
     const session_id = uuidv4();
     const now = Date.now();
+    const cleanName = sanitizeSessionName(name) || '未命名会话';
     const session = db.createSession({
       session_id,
       host_contact_id: client.client_id,
-      name,
+      name: cleanName,
       type,
       status: SESSION_STATUS.ACTIVE,
       created_at: now
@@ -402,11 +433,13 @@ function registerIpcHandlers() {
 
   ipcMain.handle(IPC.SESSION_JOIN, (_e, { session_id, host_ip, host_port }) => {
     // 加入已发现会话：建立 TCP 连接到主机
-    net.joinSession(session_id, host_ip, host_port, (msg) => handleReceivedMessage(msg));
+    const discovered = net.discoveredSessions.get(session_id);
+    net.joinSession(session_id, host_ip, host_port, (msg) => handleReceivedMessage(msg), {
+      file_port: discovered?.file_port
+    });
     // 本地记录会话：不存在则新建，已存在（如 ended 状态）则重置为 active 保留消息历史
     const existing = db.getSession(session_id);
     if (!existing) {
-      const discovered = net.discoveredSessions.get(session_id);
       db.createSession({
         session_id,
         host_contact_id: discovered?.host_contact_id || 'unknown',
@@ -430,6 +463,14 @@ function registerIpcHandlers() {
 
   // ---- 消息 ----
   ipcMain.handle(IPC.MESSAGE_SEND, async (_e, { session_id, content, type }) => {
+    // 校验会话状态：ended 或未 host/join 则拒绝发送
+    const session = db.getSession(session_id);
+    if (session && session.status === SESSION_STATUS.ENDED) {
+      return { error: '会话已结束' };
+    }
+    if (!net.isHosting(session_id) && !net.isJoined(session_id)) {
+      return { error: '未连接到会话' };
+    }
     return enqueueMessage(session_id, content, type);
   });
 
@@ -438,6 +479,19 @@ function registerIpcHandlers() {
   // ---- 文件 ----
   ipcMain.handle(IPC.FILE_UPLOAD, async (_e, { session_id, file_path }) => {
     const client = db.getClientInfo();
+    // 校验会话状态
+    const session = db.getSession(session_id);
+    if (session && session.status === SESSION_STATUS.ENDED) {
+      return { ok: false, error: '会话已结束' };
+    }
+    if (!net.isHosting(session_id) && !net.isJoined(session_id)) {
+      return { ok: false, error: '未连接到会话' };
+    }
+    // 校验文件路径授权：仅接受通过 dialog:open-file 选择的路径
+    if (!authorizedFilePaths.has(file_path)) {
+      return { ok: false, error: '文件路径未授权' };
+    }
+    authorizedFilePaths.delete(file_path); // 一次性消费
     // 阶段4：IPC 层错误处理——文件读取失败时直接返回，不创建消息记录
     let stat;
     try {
@@ -730,6 +784,7 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle(IPC.FILE_LIST, (_e, message_id) => db.listFiles(message_id));
+  ipcMain.handle(IPC.FILE_LIST_SESSION, (_e, session_id) => db.listFilesBySession(session_id));
 
   // ---- 网络 / 发现 ----
   ipcMain.handle(IPC.NETWORK_GET_DISCOVERED, () => ({
@@ -745,4 +800,4 @@ function registerIpcHandlers() {
   ipcMain.handle(IPC.DB_CLEANUP, (_e, { days } = {}) => db.cleanupOldMessages(days || 30));
 }
 
-module.exports = { init, registerIpcHandlers, net };
+module.exports = { init, registerIpcHandlers, net, addAuthorizedFilePath };

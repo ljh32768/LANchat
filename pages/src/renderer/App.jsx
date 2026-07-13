@@ -22,7 +22,6 @@ export default function App() {
   const loadSessions = useSessionsStore((s) => s.load);
   const loadContacts = useContactsStore((s) => s.load);
   const addDiscovered = useSessionsStore((s) => s.addDiscovered);
-  const perfMode = useSettingsStore((s) => s.performanceMode);
 
   useIpcEvents();
 
@@ -39,11 +38,6 @@ export default function App() {
       setBooted(true);
     })();
   }, []);
-
-  useEffect(() => {
-    document.body.classList.toggle('perf-mode', perfMode === 'performance');
-    document.body.classList.toggle('cool-mode', perfMode === 'cool');
-  }, [perfMode]);
 
   if (!booted) {
     return (

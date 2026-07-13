@@ -83,12 +83,10 @@ export const useSessionsStore = create(
       }
     },
 
+    // 仅从“局域网发现”列表移除；不把本地活跃会话标为 ended
+    // （UDP 超时/扫表也会发 session-removed，真正结束走 session:ended）
     removeDiscovered: (sessionId) => {
       set({ discovered: get().discovered.filter((s) => s.session_id !== sessionId) });
-      const sessions = get().sessions.map((s) =>
-        s.session_id === sessionId && s.status === SESSION_STATUS.ACTIVE ? { ...s, status: SESSION_STATUS.ENDED, ended_at: Date.now() } : s
-      );
-      set({ sessions });
     },
 
     markEnded: (sessionId) => {

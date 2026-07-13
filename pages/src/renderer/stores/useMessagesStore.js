@@ -38,13 +38,13 @@ export const useMessagesStore = create(
     },
 
     addReceived: (msg) => {
+      // 只负责入库到内存列表；未读由 useIpcEvents 统一累加，避免重复计数
       const sessionId = msg.session_id;
       set((state) => {
         const list = state.messagesBySession[sessionId] || [];
         if (list.some((m) => m.message_id === msg.message_id)) return state;
         return { messagesBySession: { ...state.messagesBySession, [sessionId]: [...list, msg] } };
       });
-      useSessionsStore.getState().incrementUnread(sessionId);
     },
 
     clear: (sessionId) => {

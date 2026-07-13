@@ -200,6 +200,18 @@ async function initDatabase() {
     );
   }
 
+  // 确保 self 在 contacts 表中（sessions.host_contact_id FK → contacts）
+  const self = getClientInfo();
+  if (self) {
+    const existing = queryOne('SELECT contact_id FROM contacts WHERE contact_id = ?', [self.client_id]);
+    if (!existing) {
+      execute(
+        'INSERT INTO contacts (contact_id, nickname, last_seen_ip, last_seen_at, is_favorite) VALUES (?, ?, ?, ?, 0)',
+        [self.client_id, self.nickname, null, Date.now()]
+      );
+    }
+  }
+
   return db;
 }
 
@@ -310,13 +322,20 @@ function closeSession(session_id, ended_at) {
   ]);
 }
 
-// 删除已结束会话：级联清理 files → messages → sessions（无 ON DELETE CASCADE，手动删）
+// 删除已结束会话：级联清理 file_parts → files → messages → sessions
 function deleteSession(session_id) {
-  // 先查出该会话所有 message_id，用于删 files
+  // 先查出该会话所有 message_id，用于删 files 和 file_parts
   const msgs = query('SELECT message_id FROM messages WHERE session_id = ?', [session_id]);
   if (msgs.length > 0) {
     const ids = msgs.map((m) => m.message_id);
     const placeholders = ids.map(() => '?').join(',');
+    // 查出所有 file_id，用于删 file_parts
+    const fileRows = query(`SELECT file_id FROM files WHERE message_id IN (${placeholders})`, ids);
+    if (fileRows.length > 0) {
+      const fileIds = fileRows.map((f) => f.file_id);
+      const fpPlaceholders = fileIds.map(() => '?').join(',');
+      execute(`DELETE FROM file_parts WHERE file_id IN (${fpPlaceholders})`, fileIds);
+    }
     execute(`DELETE FROM files WHERE message_id IN (${placeholders})`, ids);
   }
   execute('DELETE FROM messages WHERE session_id = ?', [session_id]);
@@ -388,6 +407,16 @@ function listFiles(message_id) {
   return query('SELECT * FROM files WHERE message_id = ?', [message_id]);
 }
 
+// 按会话查询所有文件记录（用于渲染层恢复文件下载状态）
+function listFilesBySession(session_id) {
+  return query(
+    `SELECT f.* FROM files f
+     JOIN messages m ON f.message_id = m.message_id
+     WHERE m.session_id = ?`,
+    [session_id]
+  );
+}
+
 // 多连接并行下载：file_parts 表操作
 function setFileParts(file_id, parts) {
   execute('DELETE FROM file_parts WHERE file_id = ?', [file_id]);
@@ -426,6 +455,13 @@ function setSetting(key, value) {
 // V18：清理旧消息 + VACUUM 回收空间
 function cleanupOldMessages(daysThreshold = 30) {
   const cutoff = Date.now() - daysThreshold * 24 * 60 * 60 * 1000;
+  // 级联清理 file_parts：先找出过期消息关联的 file_id
+  const oldFileIds = query('SELECT file_id FROM files WHERE message_id IN (SELECT message_id FROM messages WHERE timestamp < ?)', [cutoff]);
+  if (oldFileIds.length > 0) {
+    const ids = oldFileIds.map((f) => f.file_id);
+    const placeholders = ids.map(() => '?').join(',');
+    execute(`DELETE FROM file_parts WHERE file_id IN (${placeholders})`, ids);
+  }
   execute('DELETE FROM files WHERE message_id IN (SELECT message_id FROM messages WHERE timestamp < ?)', [cutoff]);
   execute('DELETE FROM messages WHERE timestamp < ?', [cutoff]);
   execute("DELETE FROM sessions WHERE status = 'ended' AND session_id NOT IN (SELECT DISTINCT session_id FROM messages)");
@@ -459,6 +495,7 @@ module.exports = {
   updateFileProgress,
   getFile,
   listFiles,
+  listFilesBySession,
   setFileParts,
   updateFilePartProgress,
   listFileParts,

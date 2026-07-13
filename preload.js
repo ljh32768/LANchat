@@ -3,7 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 const invokeChannels = new Set([
   'client:init', 'client:set-nickname',
-  'contacts:list', 'contacts:set-alias', 'contacts:toggle-favorite',
+  'contacts:list', 'contacts:set-alias', 'contacts:delete',
   'session:create', 'session:close', 'session:leave', 'session:delete', 'session:list', 'session:join',
   'message:send', 'message:list',
   'file:upload', 'file:download', 'file:resume', 'file:list', 'file:list-session',

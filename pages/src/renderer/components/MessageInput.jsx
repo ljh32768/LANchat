@@ -1,8 +1,10 @@
 import { useState } from 'react';
 import { useMessagesStore } from '../stores/useMessagesStore';
 import { useFilesStore } from '../stores/useFilesStore';
+import { useT } from '../locales/useLocale';
 
 export default function MessageInput({ sessionId, disabled }) {
+  const t = useT();
   const [text, setText] = useState('');
   const [uploading, setUploading] = useState(false);
   const send = useMessagesStore((s) => s.send);
@@ -51,8 +53,8 @@ export default function MessageInput({ sessionId, disabled }) {
       }
     } catch (e) {
       console.error('upload failed:', e);
-      const reason = e?.message || String(e) || '未知错误';
-      alert('文件发送失败：' + reason + '\n\n请检查网络连接后重试，或让会话主机重新创建会话。');
+      const reason = e?.message || String(e) || 'unknown error';
+      alert(t('input.sendFailed') + reason + '\n\nPlease check your network connection and try again, or ask the session host to recreate the session.');
     } finally {
       setUploading(false);
     }
@@ -60,7 +62,7 @@ export default function MessageInput({ sessionId, disabled }) {
 
   return (
     <div className="msg-input-area">
-      <button className="mi-file-btn" title="发送文件" onClick={handleFile} disabled={disabled || uploading}>
+      <button className="mi-file-btn" title={t('input.sendFile')} onClick={handleFile} disabled={disabled || uploading}>
         {uploading ? '⏳' : '📎'}
       </button>
       <textarea
@@ -68,7 +70,7 @@ export default function MessageInput({ sessionId, disabled }) {
         rows={1}
         value={text}
         disabled={disabled}
-        placeholder={disabled ? '会话已结束，无法发送' : '输入讯息…  Enter 发送，Shift+Enter 换行'}
+        placeholder={disabled ? t('input.endedPlaceholder') : t('input.placeholder')}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === 'Enter' && !e.shiftKey) {
@@ -78,7 +80,7 @@ export default function MessageInput({ sessionId, disabled }) {
         }}
       />
       <button className="mi-send-btn" onClick={handleSend} disabled={disabled || !text.trim()}>
-        发送
+        {t('input.send')}
       </button>
     </div>
   );

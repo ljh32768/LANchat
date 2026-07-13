@@ -3,8 +3,8 @@ import { useClientStore } from './stores/useClientStore';
 import { useSettingsStore } from './stores/useSettingsStore';
 import { useSessionsStore } from './stores/useSessionsStore';
 import { useContactsStore } from './stores/useContactsStore';
+import { useLocaleStore } from './locales/useLocale';
 import { useIpcEvents } from './hooks/useIpcEvents';
-import LoginScreen from './components/LoginScreen';
 import TitleBar from './components/TitleBar';
 import Sidebar from './components/Sidebar';
 import ChatView from './components/ChatView';
@@ -13,12 +13,12 @@ import NewSessionModal from './components/NewSessionModal';
 
 export default function App() {
   const [booted, setBooted] = useState(false);
-  const [entered, setEntered] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showNewSession, setShowNewSession] = useState(false);
 
   const initClient = useClientStore((s) => s.init);
   const loadSettings = useSettingsStore((s) => s.load);
+  const loadLocale = useLocaleStore((s) => s.load);
   const loadSessions = useSessionsStore((s) => s.load);
   const loadContacts = useContactsStore((s) => s.load);
   const addDiscovered = useSessionsStore((s) => s.addDiscovered);
@@ -29,6 +29,7 @@ export default function App() {
     (async () => {
       await initClient();
       await loadSettings();
+      await loadLocale();
       await loadSessions();
       await loadContacts();
       try {
@@ -40,19 +41,7 @@ export default function App() {
   }, []);
 
   if (!booted) {
-    return (
-      <div className="app-shell">
-        <div className="boot-screen">
-          <div className="boot-logo">LAN·CHATROOM</div>
-          <div className="boot-spinner" />
-          <div className="boot-text">系统初始化中…</div>
-        </div>
-      </div>
-    );
-  }
-
-  if (!entered) {
-    return <LoginScreen onEnter={() => setEntered(true)} />;
+    return <div className="app-shell" />;
   }
 
   return (

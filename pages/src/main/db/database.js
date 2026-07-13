@@ -273,11 +273,15 @@ function upsertContact({ contact_id, nickname, last_seen_ip, last_seen_at }) {
 
 function listContacts() {
   // 收藏优先 + 按昵称/别名稳定排序 + contact_id 兜底（避免重名时位置互换）
-  return query('SELECT * FROM contacts ORDER BY is_favorite DESC, COALESCE(NULLIF(alias, \'\'), nickname) ASC, contact_id ASC');
+  return query('SELECT * FROM contacts ORDER BY COALESCE(NULLIF(alias, \'\'), nickname) ASC, contact_id ASC');
 }
 
 function setAlias(contact_id, alias) {
   execute('UPDATE contacts SET alias = ? WHERE contact_id = ?', [alias, contact_id]);
+}
+
+function deleteContact(contact_id) {
+  execute('DELETE FROM contacts WHERE contact_id = ?', [contact_id]);
 }
 
 function toggleFavorite(contact_id) {
@@ -480,7 +484,7 @@ module.exports = {
   upsertContact,
   listContacts,
   setAlias,
-  toggleFavorite,
+  deleteContact,
   listSessions,
   touchSession,
   getSession,

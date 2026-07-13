@@ -35,8 +35,8 @@ export const useContactsStore = create(
       set({ contacts });
     },
 
-    toggleFavorite: async (contactId) => {
-      const contacts = await window.api.invoke('contacts:toggle-favorite', contactId);
+    deleteContact: async (contactId) => {
+      const contacts = await window.api.invoke('contacts:delete', { contact_id: contactId });
       set({ contacts });
     },
 

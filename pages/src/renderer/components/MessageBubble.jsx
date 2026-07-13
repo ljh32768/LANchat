@@ -1,5 +1,6 @@
 import { useFilesStore } from '../stores/useFilesStore';
 import { resolveIdentity } from '../utils/identity';
+import { useT, useLocaleStore } from '../locales/useLocale';
 
 function formatTime(ts) {
   if (!ts) return '';
@@ -31,6 +32,7 @@ function getFileIcon(fileName) {
 }
 
 export default function MessageBubble({ message, isSelf, clientId, contacts, peers, hostIp, filePort, ended }) {
+  const t = useT();
   const download = useFilesStore((s) => s.download);
   const resume = useFilesStore((s) => s.resume);
 
@@ -88,23 +90,23 @@ function FileCard({ meta, isSelf, ended, onDownload, onResume }) {
       <div className="file-info">
         <div className="file-name" title={meta.file_name}>{meta.file_name}</div>
         <div className="file-size">{formatSize(meta.file_size)}</div>
-        {status === 'failed' && <div className="file-failed">下载失败</div>}
+        {status === 'failed' && <div className="file-failed">{t('msg.downloadFailed')}</div>}
       </div>
       <div className="file-action">
         {isEmpty ? (
-          <span className="file-unavail">空文件</span>
+          <span className="file-unavail">{t('msg.emptyFile')}</span>
         ) : isSelf ? (
-          <span className="file-done">✓ 已暂存</span>
+          <span className="file-done">{t('msg.cached')}</span>
         ) : status === 'completed' ? (
-          <span className="file-done">✓ 已下载</span>
+          <span className="file-done">{t('msg.downloaded')}</span>
         ) : status === 'downloading' ? (
           <FileRing progress={progress} />
         ) : status === 'failed' ? (
-          <button className="file-dl-btn" onClick={onResume}>↻ 重试</button>
+          <button className="file-dl-btn" onClick={onResume}>{t('msg.retry')}</button>
         ) : ended ? (
-          <span className="file-unavail">不可用</span>
+          <span className="file-unavail">{t('msg.unavailable')}</span>
         ) : (
-          <button className="file-dl-btn" onClick={onDownload}>下载</button>
+          <button className="file-dl-btn" onClick={onDownload}>{t('msg.download')}</button>
         )}
       </div>
     </div>

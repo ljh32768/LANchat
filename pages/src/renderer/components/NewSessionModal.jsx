@@ -2,8 +2,10 @@ import { useState } from 'react';
 import { useSessionsStore } from '../stores/useSessionsStore';
 import { useMessagesStore } from '../stores/useMessagesStore';
 import { useContactsStore } from '../stores/useContactsStore';
+import { useT } from '../locales/useLocale';
 
 export default function NewSessionModal({ onClose }) {
+  const t = useT();
   const create = useSessionsStore((s) => s.create);
   const loadMessages = useMessagesStore((s) => s.load);
   const peers = useContactsStore((s) => s.peers);
@@ -35,38 +37,38 @@ export default function NewSessionModal({ onClose }) {
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-card" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <span>新建会话</span>
+          <span>{t('ns.title')}</span>
           <button className="modal-close" onClick={onClose}>✕</button>
         </div>
         <div className="modal-body">
           <div className="setting-row">
-            <label>会话名称</label>
+            <label>{t('ns.sessionName')}</label>
             <input
               className="setting-input"
               value={name}
               autoFocus
               maxLength={32}
-              placeholder={type === 'private' ? '例如：与指挥官的专线' : '例如：控制中心会议室'}
+              placeholder={type === 'private' ? t('ns.privateNamePlaceholder') : t('ns.namePlaceholder')}
               onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && canCreate && handleCreate()}
             />
           </div>
           <div className="setting-row">
-            <label>类型</label>
+            <label>{t('ns.type')}</label>
             <div className="setting-modes">
               <button className={`mode-btn ${type === 'group' ? 'on' : ''}`} onClick={() => { setType('group'); setSelectedPeer(null); }}>
-                ⬡ 群聊
+                {t('ns.group')}
               </button>
               <button className={`mode-btn ${type === 'private' ? 'on' : ''}`} onClick={() => setType('private')}>
-                ◈ 私聊
+                {t('ns.private')}
               </button>
             </div>
           </div>
           {type === 'private' ? (
             <div className="setting-row">
-              <label>邀请对象（在线联系人）</label>
+              <label>{t('ns.invitee')}</label>
               {peers.length === 0 ? (
-                <div className="setting-hint">暂无在线联系人，等待其他人启动客户端…</div>
+                <div className="setting-hint">{t('ns.noOnline')}</div>
               ) : (
                 <div className="peer-list">
                   {peers.map((p) => (
@@ -82,16 +84,16 @@ export default function NewSessionModal({ onClose }) {
                   ))}
                 </div>
               )}
-              <div className="setting-hint">私聊仅邀请指定对象，不广播到局域网。</div>
+              <div className="setting-hint">{t('ns.privateHint')}</div>
             </div>
           ) : (
-            <div className="setting-hint">创建后你即为主机，其他人可通过局域网发现并加入。</div>
+            <div className="setting-hint">{t('ns.groupHint')}</div>
           )}
         </div>
         <div className="modal-footer">
-          <button className="setting-btn ghost" onClick={onClose}>取消</button>
+          <button className="setting-btn ghost" onClick={onClose}>{t('ns.cancel')}</button>
           <button className="setting-btn" onClick={handleCreate} disabled={busy || !canCreate}>
-            {busy ? '创建中…' : '创建会话'}
+            {busy ? t('ns.creating') : t('ns.create')}
           </button>
         </div>
       </div>

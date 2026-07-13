@@ -11,8 +11,7 @@ CREATE TABLE IF NOT EXISTS contacts (
   nickname      TEXT,
   alias         TEXT,
   last_seen_ip  TEXT,
-  last_seen_at  INTEGER,
-  is_favorite   INTEGER DEFAULT 0
+  last_seen_at  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sessions (

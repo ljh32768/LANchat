@@ -4,8 +4,10 @@ import { useContactsStore } from '../stores/useContactsStore';
 import { useMessagesStore } from '../stores/useMessagesStore';
 import { useClientStore } from '../stores/useClientStore';
 import { resolveIdentity } from '../utils/identity';
+import { useT } from '../locales/useLocale';
 
 export default function Sidebar({ onNewSession }) {
+  const t = useT();
   const sessions = useSessionsStore((s) => s.sessions);
   const discovered = useSessionsStore((s) => s.discovered);
   const activeSessionId = useSessionsStore((s) => s.activeSessionId);
@@ -16,8 +18,8 @@ export default function Sidebar({ onNewSession }) {
   const contacts = useContactsStore((s) => s.contacts);
   const onlineIds = useContactsStore((s) => s.onlineIds);
   const peers = useContactsStore((s) => s.peers);
-  const toggleFavorite = useContactsStore((s) => s.toggleFavorite);
   const setAlias = useContactsStore((s) => s.setAlias);
+  const deleteContact = useContactsStore((s) => s.deleteContact);
   const loadMessages = useMessagesStore((s) => s.load);
   const clientId = useClientStore((s) => s.clientId);
 
@@ -39,13 +41,13 @@ export default function Sidebar({ onNewSession }) {
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
-        <span className="sidebar-title">通讯矩阵</span>
-        <button className="btn-new" onClick={onNewSession}>＋ 新建</button>
+        <span className="sidebar-title">{t('sidebar.title')}</span>
+        <button className="btn-new" onClick={onNewSession}>{t('sidebar.newSession')}</button>
       </div>
 
       <div className="sidebar-scroll">
-        <Section title="活跃会话" count={activeSessions.length}>
-          {activeSessions.length === 0 && <Empty text="尚无活跃会话" />}
+        <Section title={t('sidebar.activeSessions')} count={activeSessions.length}>
+          {activeSessions.length === 0 && <Empty text={t('sidebar.noActiveSessions')} />}
           {activeSessions.map((s) => (
             <SessionItem
               key={s.session_id}
@@ -59,7 +61,7 @@ export default function Sidebar({ onNewSession }) {
         </Section>
 
         {discoverable.length > 0 && (
-          <Section title="局域网发现" count={discoverable.length}>
+          <Section title={t('sidebar.discovered')} count={discoverable.length}>
             {discoverable.map((s) => (
               <DiscoveredItem
                 key={s.session_id}
@@ -73,13 +75,13 @@ export default function Sidebar({ onNewSession }) {
         )}
 
         {discoverable.length === 0 && (
-          <Section title="局域网发现" count={0}>
-            <Empty text="未发现可加入的会话" />
+          <Section title={t('sidebar.discovered')} count={0}>
+            <Empty text={t('sidebar.noDiscovered')} />
           </Section>
         )}
 
         {endedSessions.length > 0 && (
-          <Section title="已结束" count={endedSessions.length}>
+          <Section title={t('sidebar.ended')} count={endedSessions.length}>
             {endedSessions.map((s) => (
               <SessionItem
                 key={s.session_id}
@@ -95,8 +97,8 @@ export default function Sidebar({ onNewSession }) {
           </Section>
         )}
 
-        <Section title="联系人" count={contacts.length}>
-          {contacts.length === 0 && <Empty text="尚未发现其他用户" />}
+        <Section title={t('sidebar.contacts')} count={contacts.length}>
+          {contacts.length === 0 && <Empty text={t('sidebar.noContacts')} />}
           {contacts.map((c) => (
             <ContactItem
               key={c.contact_id}
@@ -105,8 +107,8 @@ export default function Sidebar({ onNewSession }) {
               contacts={contacts}
               online={onlineIds.has(c.contact_id)}
               self={c.contact_id === clientId}
-              onToggleFavorite={toggleFavorite}
               onSetAlias={setAlias}
+              onDeleteContact={deleteContact}
             />
           ))}
         </Section>
@@ -129,33 +131,36 @@ function Empty({ text }) {
 }
 
 function SessionItem({ name, type, active, ended, unread, onClick, onDelete }) {
+  const t = useT();
   return (
     <div className={`sb-item-row ${ended ? 'ended' : ''}`}>
       <button className={`sb-item ${active ? 'active' : ''} ${ended ? 'ended' : ''}`} onClick={onClick}>
         <span className="sb-icon">{type === 'private' ? '◈' : '⬡'}</span>
         <span className="sb-name">{name}</span>
-        {ended && <span className="sb-tag ended-tag">已结束</span>}
+        {ended && <span className="sb-tag ended-tag">{t('sidebar.endedTag')}</span>}
         {!ended && unread > 0 && <span className="sb-unread">{unread}</span>}
       </button>
       {ended && onDelete && (
-        <button className="sb-del" title="删除会话" onClick={onDelete}>✕</button>
+        <button className="sb-del" title={t('sidebar.deleteSession')} onClick={onDelete}>✕</button>
       )}
     </div>
   );
 }
 
 function DiscoveredItem({ name, type, members, onClick }) {
+  const t = useT();
   return (
     <button className="sb-item discovered" onClick={onClick}>
       <span className="sb-icon">{type === 'private' ? '◈' : '⬡'}</span>
       <span className="sb-name">{name}</span>
-      <span className="sb-members">{members}人</span>
-      <span className="sb-join">加入</span>
+      <span className="sb-members">{t('sidebar.members', { n: members })}</span>
+      <span className="sb-join">{t('sidebar.join')}</span>
     </button>
   );
 }
 
-function ContactItem({ contact, peers, contacts, online, self, onToggleFavorite, onSetAlias }) {
+function ContactItem({ contact, peers, contacts, online, self, onSetAlias, onDeleteContact }) {
+  const t = useT();
   const [editing, setEditing] = useState(false);
   const [aliasInput, setAliasInput] = useState('');
 
@@ -191,7 +196,7 @@ function ContactItem({ contact, peers, contacts, online, self, onToggleFavorite,
             if (e.key === 'Enter') saveAlias();
             if (e.key === 'Escape') setEditing(false);
           }}
-          placeholder="备注名"
+          placeholder={t('sidebar.aliasPlaceholder')}
         />
       ) : (
         <>
@@ -199,19 +204,13 @@ function ContactItem({ contact, peers, contacts, online, self, onToggleFavorite,
             {identity.segs.map((seg, i) => (
               <span key={i} className={seg.cls}>{seg.text}</span>
             ))}
-            {self && '（我）'}
+            {self && t('sidebar.self')}
+            {contact.alias && <span className="sb-alias">{contact.alias}</span>}
           </span>
-          {contact.is_favorite && <span className="sb-star">★</span>}
           {!self && (
             <div className="sb-contact-actions">
-              <button
-                className="sb-action"
-                title={contact.is_favorite ? '取消星标' : '星标联系人'}
-                onClick={() => onToggleFavorite(contact.contact_id)}
-              >
-                {contact.is_favorite ? '☆' : '★'}
-              </button>
-              <button className="sb-action" title="设置备注名" onClick={startEdit}>✎</button>
+              <button className="sb-action" title={t('sidebar.editAlias')} onClick={startEdit}>✎</button>
+              <button className="sb-action sb-del-action" title={t('sidebar.deleteContact')} onClick={() => onDeleteContact(contact.contact_id)}>✕</button>
             </div>
           )}
         </>

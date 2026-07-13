@@ -5,6 +5,7 @@ import { useMessagesStore } from '../stores/useMessagesStore';
 import { useClientStore } from '../stores/useClientStore';
 import { useContactsStore } from '../stores/useContactsStore';
 import { useFilesStore } from '../stores/useFilesStore';
+import { useT } from '../locales/useLocale';
 import MessageBubble from './MessageBubble';
 import MessageInput from './MessageInput';
 
@@ -15,6 +16,7 @@ const DEFAULT_FILE_PORT = 47890;
 const EMPTY_MESSAGES = [];
 
 export default function ChatView() {
+  const t = useT();
   const activeSessionId = useSessionsStore((s) => s.activeSessionId);
   const sessions = useSessionsStore((s) => s.sessions);
   const discovered = useSessionsStore((s) => s.discovered);
@@ -50,8 +52,8 @@ export default function ChatView() {
       <main className="chat-view empty">
         <div className="chat-placeholder">
           <div className="ph-glyph">⬡</div>
-          <div className="ph-title">选择一个会话开始通讯</div>
-          <div className="ph-sub">或新建会话 / 加入局域网发现的会话</div>
+          <div className="ph-title">{t('chatview.placeholderTitle')}</div>
+          <div className="ph-sub">{t('chatview.placeholderSub')}</div>
         </div>
       </main>
     );
@@ -69,23 +71,23 @@ export default function ChatView() {
     <main className="chat-view">
       <header className="chat-header">
         <div className="chat-title">
-          <span className="chat-type">{session.type === 'private' ? '◈ 私聊' : '⬡ 群聊'}</span>
+          <span className="chat-type">{session.type === 'private' ? t('chatview.privateTag') : t('chatview.groupTag')}</span>
           <span className="chat-name">{session.name}</span>
-          {isHost && <span className="chat-host">主机</span>}
-          {ended && <span className="chat-ended-tag">已结束</span>}
+          {isHost && <span className="chat-host">{t('chatview.hostTag')}</span>}
+          {ended && <span className="chat-ended-tag">{t('chatview.endedTag')}</span>}
         </div>
         {!ended && (
           <button
             className="chat-close"
             onClick={() => (isHost ? close(session.session_id) : leave(session.session_id))}
           >
-            {isHost ? '解散会话' : '离开会话'}
+            {isHost ? t('chatview.closeSession') : t('chatview.leaveSession')}
           </button>
         )}
       </header>
 
       <div className="chat-messages" ref={scrollRef}>
-        {messages.length === 0 && <div className="chat-empty-msg">暂无消息，发送第一条讯息吧。</div>}
+        {messages.length === 0 && <div className="chat-empty-msg">{t('chatview.noMessages')}</div>}
         {messages.map((m) => {
           const isSelf = m.sender_contact_id === 'self' || m.sender_contact_id === clientId;
           return (

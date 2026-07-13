@@ -372,11 +372,10 @@ function registerIpcHandlers() {
     db.setAlias(contact_id, alias);
     return db.listContacts();
   });
-  ipcMain.handle(IPC.CONTACTS_TOGGLE_FAVORITE, (_e, contact_id) => {
-    db.toggleFavorite(contact_id);
+  ipcMain.handle(IPC.CONTACTS_DELETE, (_e, { contact_id }) => {
+    db.deleteContact(contact_id);
     return db.listContacts();
   });
-
   // ---- 会话 ----
   ipcMain.handle(IPC.SESSION_CREATE, (_e, { name, type, invitee_ip, invitee_client_id }) => {
     const client = db.getClientInfo();

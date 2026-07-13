@@ -46,7 +46,7 @@ const IPC = {
   // 联系人
   CONTACTS_LIST: 'contacts:list',
   CONTACTS_SET_ALIAS: 'contacts:set-alias',
-  CONTACTS_TOGGLE_FAVORITE: 'contacts:toggle-favorite',
+  CONTACTS_DELETE: 'contacts:delete',
   // 会话
   SESSION_CREATE: 'session:create',
   SESSION_CLOSE: 'session:close', // 主机关闭会话（会话结束，通知所有成员）

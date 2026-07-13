@@ -1,6 +1,6 @@
 {
   "name": "lanchatroom",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "A LAN chatroom - a digital renaissance of the space age.",
   "license": "MIT",
   "author": "ljh32768 with AI",
@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
-    "build": "vite build",
+    "build": "electron-builder",
     "preview": "electron .",
     "dist": "npm run build && electron-builder --win",
     "dist:portable": "npm run build && electron-builder --win portable",
@@ -47,7 +47,7 @@
       "allowToChangeInstallationDirectory": true,
       "language": "2052",
       "shortcutName": "LANChatroom",
-      "uninstallDisplayName": "LANChatroom 0.1.1"
+      "uninstallDisplayName": "LANChatroom 0.2.0"
     },
     "compression": "store",
     "electronDist": "node_modules/electron/dist",

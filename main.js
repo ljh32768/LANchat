@@ -4,8 +4,16 @@ const path = require('path');
 const fs = require('fs');
 const { init, registerIpcHandlers, net, addAuthorizedFilePath } = require('./pages/src/main/ipc');
 const db = require('./pages/src/main/db/database');
+const notificationService = require('./pages/src/main/notificationService');
 
 const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production';
+
+// ---- Windows：必须在 app ready 之前设置 AppUserModelId ----
+// 否则通知中心/Toast 会显示为 "Electron" 或缺少应用图标与名称。
+// 值应与 package.json 中 build.appId 保持一致。
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.lanchatroom.app');
+}
 
 // userData 目录：开发环境用项目内 data/，打包后用系统标准目录
 if (isDev) {
@@ -100,6 +108,9 @@ function createWindow() {
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
+
+  // 窗口创建后同步给通知服务（ipc.init 会再次 init；此处覆盖重建窗口场景）
+  notificationService.setMainWindow(mainWindow);
 }
 
 // 单实例锁
@@ -108,10 +119,8 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-    }
+    // 与点击通知一致：恢复最小化并强制聚焦
+    notificationService.focusMainWindow();
   });
 
   app.whenReady().then(async () => {
@@ -143,12 +152,19 @@ if (!gotTheLock) {
       return result.filePaths[0];
     });
     // 初始化数据库与网络（mainWindow 就绪后）
+    // 桌面通知服务在 ipc.init 内绑定窗口 + macOS 快捷回复回调
     if (mainWindow) {
       await init(mainWindow);
     }
 
-    app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    app.on('activate', async () => {
+      // macOS：点击 Dock 图标时若无窗口则重建，并重新绑定通知服务
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+        if (mainWindow) await init(mainWindow);
+      } else {
+        notificationService.focusMainWindow();
+      }
     });
   });
 }
@@ -161,4 +177,5 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   try { db.persistNow(); } catch {}
   try { net.stop(); } catch {}
+  try { notificationService.dispose(); } catch {}
 });

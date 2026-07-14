@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const db = require('../db/database');
 const { NetworkManager } = require('../network/network');
+const notificationService = require('../notificationService');
 const {
   IPC,
   IPC_EVENT,
@@ -219,8 +220,30 @@ function handleReceivedMessage(msg, options = {}) {
       content: msg.content,
       type: msg.type,
       timestamp: msg.timestamp,
-      source
+      source,
+      // 供渲染层/通知展示发送者昵称（历史同步同样带上无妨）
+      sender_nickname: msg.sender_nickname || null
     });
+
+    // 仅「首次入库」的实时消息弹桌面通知，避免重放/补推刷屏
+    // history / self-reply 不弹；聚焦时服务内部也会跳过
+    if (!existing && source !== 'history' && source !== 'self-reply') {
+      try {
+        const me = db.getClientInfo();
+        if (!(me && msg.sender_contact_id && msg.sender_contact_id === me.client_id)) {
+          notificationService.notifyNewMessage({
+            session_id: msg.session_id,
+            sender_contact_id: msg.sender_contact_id,
+            sender_nickname: msg.sender_nickname,
+            content: msg.content,
+            type: msg.type,
+            source
+          });
+        }
+      } catch (ne) {
+        console.error('[ipc] notifyNewMessage error:', ne);
+      }
+    }
   } catch (e) {
     console.error('[ipc] handleReceivedMessage error:', e);
   }
@@ -343,6 +366,42 @@ function registerNetworkEvents() {
 async function init(window) {
   mainWindow = window;
   await db.initDatabase();
+
+  // 从设置恢复桌面通知开关
+  const desktopNotify = db.getSetting('desktopNotifyEnabled', 'true');
+  notificationService.setEnabled(desktopNotify !== 'false');
+
+  // 桌面通知：绑定主窗口；macOS 快捷回复直接走消息发送队列
+  notificationService.init(window, {
+    onReply: ({ session_id, content }) => {
+      try {
+        if (!session_id || !content) return;
+        const session = db.getSession(session_id);
+        if (session && session.status === SESSION_STATUS.ENDED) return;
+        if (!net.isHosting(session_id) && !net.isJoined(session_id)) return;
+        // 与输入框发送同一路径：限速 + 入库 + 网络
+        const result = enqueueMessage(session_id, content, MSG_TYPE.TEXT);
+        // 通知渲染层插入自己的回复（避免仅主进程发送、UI 不刷新）
+        // source=self-reply：渲染层入库但不计未读、不响提示、不弹桌面通知
+        if (result && result.message_id && !result.error) {
+          const client = db.getClientInfo();
+          send(IPC_EVENT.MESSAGE_RECEIVED, {
+            message_id: result.message_id,
+            session_id,
+            sender_contact_id: client.client_id,
+            content,
+            type: MSG_TYPE.TEXT,
+            timestamp: result.timestamp,
+            source: 'self-reply',
+            sender_nickname: client.nickname,
+            local_id: result.local_id
+          });
+        }
+      } catch (e) {
+        console.error('[ipc] notification reply send error:', e);
+      }
+    }
+  });
 
   const clientInfo = db.getClientInfo();
   if (!initialized) {
@@ -793,7 +852,20 @@ function registerIpcHandlers() {
 
   // ---- 设置 ----
   ipcMain.handle(IPC.SETTINGS_GET, (_e, { key, defaultValue }) => db.getSetting(key, defaultValue ?? null));
-  ipcMain.handle(IPC.SETTINGS_SET, (_e, { key, value }) => db.setSetting(key, value));
+  ipcMain.handle(IPC.SETTINGS_SET, (_e, { key, value }) => {
+    db.setSetting(key, value);
+    // 设置变更时同步桌面通知开关（兼容直接改 settings 表）
+    if (key === 'desktopNotifyEnabled') {
+      notificationService.setEnabled(value !== 'false' && value !== false);
+    }
+    return true;
+  });
+
+  // 桌面通知：渲染进程开关
+  ipcMain.handle('notification:set-enabled', (_e, { enabled } = {}) => {
+    notificationService.setEnabled(enabled !== false);
+    return { ok: true, enabled: notificationService.isEnabled() };
+  });
 
   // V18：数据库清理（清理 N 天前消息 + VACUUM）
   ipcMain.handle(IPC.DB_CLEANUP, (_e, { days } = {}) => db.cleanupOldMessages(days || 30));

@@ -25,6 +25,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "icon.ico",
       "dist/**/*",
       "node_modules/**/*",
       "package.json",

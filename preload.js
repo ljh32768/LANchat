@@ -11,7 +11,9 @@ const invokeChannels = new Set([
   'settings:get', 'settings:set',
   'window:close', 'window:minimize', 'window:maximize', 'window:flash',
   'dialog:open-file',
-  'db:cleanup'
+  'db:cleanup',
+  // 桌面通知开关（主进程 Notification 服务）
+  'notification:set-enabled'
 ]);
 
 const eventChannels = new Set([
@@ -22,7 +24,10 @@ const eventChannels = new Set([
   'file:download-progress',
   'file:download-complete',
   'session:ended',
-  'session:created'
+  'session:created',
+  // 桌面通知交互（主进程 → 渲染）
+  'notification:clicked',
+  'notification:reply'
 ]);
 
 contextBridge.exposeInMainWorld('api', {

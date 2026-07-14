@@ -2,7 +2,9 @@ import { useState } from 'react';
 import { useClientStore } from '../stores/useClientStore';
 import { useSessionsStore } from '../stores/useSessionsStore';
 import { useMessagesStore } from '../stores/useMessagesStore';
+import { useSettingsStore } from '../stores/useSettingsStore';
 import { useT, useLocaleStore } from '../locales/useLocale';
+import { playMessageSound } from '../utils/sound';
 
 export default function SettingsPanel({ onClose }) {
   const t = useT();
@@ -10,6 +12,10 @@ export default function SettingsPanel({ onClose }) {
   const setLocale = useLocaleStore((s) => s.setLocale);
   const nickname = useClientStore((s) => s.nickname);
   const setNickname = useClientStore((s) => s.setNickname);
+  const soundEnabled = useSettingsStore((s) => s.soundEnabled);
+  const setSoundEnabled = useSettingsStore((s) => s.setSoundEnabled);
+  const desktopNotifyEnabled = useSettingsStore((s) => s.desktopNotifyEnabled);
+  const setDesktopNotifyEnabled = useSettingsStore((s) => s.setDesktopNotifyEnabled);
 
   const [name, setName] = useState(nickname);
   const [saved, setSaved] = useState(false);
@@ -47,6 +53,30 @@ export default function SettingsPanel({ onClose }) {
               </button>
               <button className={`mode-btn ${locale === 'en' ? 'on' : ''}`} onClick={() => setLocale('en')}>
                 English
+              </button>
+            </div>
+          </div>
+
+          <div className="setting-row">
+            <label>{t('settings.notifications')}</label>
+            <div className="setting-modes">
+              <button
+                className={`mode-btn ${desktopNotifyEnabled ? 'on' : ''}`}
+                onClick={() => setDesktopNotifyEnabled(!desktopNotifyEnabled)}
+                title={t('settings.desktopNotifyHint')}
+              >
+                {desktopNotifyEnabled ? t('settings.desktopNotifyOn') : t('settings.desktopNotifyOff')}
+              </button>
+              <button
+                className={`mode-btn ${soundEnabled ? 'on' : ''}`}
+                onClick={() => {
+                  const next = !soundEnabled;
+                  setSoundEnabled(next);
+                  if (next) playMessageSound();
+                }}
+                title={t('settings.soundHint')}
+              >
+                {soundEnabled ? t('settings.soundOn') : t('settings.soundOff')}
               </button>
             </div>
           </div>

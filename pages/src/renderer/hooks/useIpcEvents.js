@@ -7,6 +7,11 @@ import { useContactsStore } from '../stores/useContactsStore';
 import { useSettingsStore } from '../stores/useSettingsStore';
 import { playMessageSound } from '../utils/sound';
 
+/** 不计入未读 / 不触发提示的消息来源 */
+function isQuietSource(source) {
+  return source === 'history' || source === 'self-reply' || source === 'local';
+}
+
 export function useIpcEvents() {
   useEffect(() => {
     const unsubs = [];
@@ -50,23 +55,32 @@ export function useIpcEvents() {
       const batch = pendingMessages;
       pendingMessages = [];
 
-      // 历史同步消息：只入库，不涨未读、不响提示
+      // 历史同步 / 本机快捷回复：只入库，不涨未读、不响提示
       const live = [];
       for (const msg of batch) {
         messageStore.addReceived(msg);
-        if (msg.source === 'history') continue;
+        if (isQuietSource(msg.source)) continue;
         live.push(msg);
-        sessionStore.incrementUnread(msg.session_id);
+        // 当前正在看的会话不累加未读
+        if (sessionStore.activeSessionId !== msg.session_id) {
+          sessionStore.incrementUnread(msg.session_id);
+        }
       }
 
-      // 私聊强反馈：本批最多触发一次，避免历史/刷屏时连闪
+      if (live.length === 0) return;
+
+      // 窗口未聚焦时：轻微提示音（所有会话）；私聊额外闪框/描边
+      const unfocused = !document.hasFocus();
+      if (unfocused && soundOn) {
+        playMessageSound();
+      }
+
       const hasPrivateLive = live.some((msg) => {
         const session = sessions.find((s) => s.session_id === msg.session_id);
         return session?.type === 'private';
       });
       if (hasPrivateLive) {
-        if (soundOn && !document.hasFocus()) playMessageSound();
-        if (!document.hasFocus()) {
+        if (unfocused) {
           window.api.invoke('window:flash').catch(() => {});
         }
         document.body.classList.add('pulse-border');
@@ -81,6 +95,27 @@ export function useIpcEvents() {
           rafScheduled = true;
           requestAnimationFrame(flushUpdates);
         }
+      })
+    );
+
+    // 点击系统桌面通知 → 主进程已聚焦窗口；此处切到对应会话
+    unsubs.push(
+      window.api.on('notification:clicked', ({ session_id }) => {
+        if (!session_id) return;
+        useSessionsStore.getState().setActive(session_id);
+        // 确保消息列表已加载
+        const loaded = useMessagesStore.getState().loadedSessions;
+        if (!loaded.has(session_id)) {
+          useMessagesStore.getState().load(session_id).catch(() => {});
+        }
+      })
+    );
+
+    // macOS 快捷回复后主进程已发送；渲染层收到 notification:reply 时可做额外 UI（可选）
+    // 实际消息会再走 message:received (source=self-reply)
+    unsubs.push(
+      window.api.on('notification:reply', ({ session_id }) => {
+        if (session_id) useSessionsStore.getState().setActive(session_id);
       })
     );
     // V15：文件下载进度用 rAF 节流，避免每个 TCP 块都触发 React 重渲染

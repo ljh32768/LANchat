@@ -4,6 +4,21 @@
 
 ---
 
+## 未发布 - 桌面通知
+
+### ✨ 新功能
+- **跨平台系统桌面通知**（`pages/src/main/notificationService.js`）
+  - 窗口聚焦时不打扰
+  - 点击通知恢复并聚焦主窗口，并切换到对应会话
+  - 同一发送者 5 秒内多条消息聚合为「收到 N 条新消息」
+  - Windows：`AppUserModelId = com.lanchatroom.app`（与 `build.appId` 一致）
+  - macOS：通知中心快捷回复（`hasReply`），回复走 `message:send` 同一队列
+  - Linux：标准 Electron `Notification` API
+- **渲染进程提示音**：未聚焦时 `playMessageSound()`（WebAudio，系统通知静音防叠音）
+- **设置项**：桌面通知 / 提示音 独立开关
+
+---
+
 ## v0.1.1 - 2026-07-11
 
 ### 🚀 性能优化

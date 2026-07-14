@@ -80,6 +80,7 @@ export default function MessageBubble({ message, isSelf, clientId, contacts, pee
 }
 
 function FileCard({ meta, isSelf, ended, onDownload, onResume }) {
+  const t = useT();
   const progress = useFilesStore((s) => s.progress[meta.file_id] ?? null);
   const status = useFilesStore((s) => s.status[meta.file_id] ?? (isSelf ? 'completed' : 'pending'));
   const isEmpty = !meta.file_size || meta.file_size === 0;

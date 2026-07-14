@@ -44,7 +44,7 @@
   "titlebar.maximize": "Maximize",
   "titlebar.close": "Close",
   "settings.title": "Settings",
-  "settings.nickname": "Nickname",
+  "settings.nickname": "name",
   "settings.save": "Save",
   "settings.saved": "Saved",
   "settings.dataCleanup": "Data Cleanup",

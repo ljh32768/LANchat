@@ -1,6 +1,6 @@
 // IPC 处理器：将数据库与网络层的能力暴露给渲染进程。
 const { ipcMain, app, dialog } = require('electron');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4, v5: uuidv5 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 const db = require('../db/database');
@@ -22,6 +22,305 @@ let initialized = false;
 // 文件路径授权白名单：dialog:open-file 选择后授权，file:upload 消费后移除（一次性）
 const authorizedFilePaths = new Set();
 function addAuthorizedFilePath(p) { if (p) authorizedFilePaths.add(p); }
+
+// 私聊确定性 session_id 命名空间（固定 UUID，保证两端算出同一 id）
+const PRIVATE_SESSION_NS = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+
+// 私聊离线待发：session_id -> [{ content, type, message_id, local_id, timestamp }]
+const pendingPrivateSends = new Map();
+
+function privateSessionId(selfId, peerId) {
+  const pair = [selfId, peerId].sort().join(':');
+  return uuidv5(pair, PRIVATE_SESSION_NS);
+}
+
+function shouldHostPrivate(selfId, peerId) {
+  return selfId < peerId;
+}
+
+function privateDisplayName(peerId, peerNickname) {
+  try {
+    const c = db.listContacts().find((x) => x.contact_id === peerId);
+    if (c) return c.alias || c.nickname || peerNickname || '私聊';
+  } catch {}
+  return peerNickname || '私聊';
+}
+
+function resolvePeerIp(peerId, hintIp) {
+  if (hintIp) return hintIp;
+  const live = net.peers && net.peers.get ? net.peers.get(peerId) : null;
+  if (live && live.ip) return live.ip;
+  try {
+    const c = db.listContacts().find((x) => x.contact_id === peerId);
+    if (c && c.last_seen_ip) return c.last_seen_ip;
+  } catch {}
+  return null;
+}
+
+/** 确保本机作为主机托管某私聊，并（若有 IP）发出邀请。幂等。 */
+function ensureHostPrivateSession({ session_id, peer_id, peer_ip, peer_nickname, name }) {
+  const client = db.getClientInfo();
+  const displayName = name || privateDisplayName(peer_id, peer_nickname);
+  let session = db.getSession(session_id);
+  if (!session) {
+    session = db.createSession({
+      session_id,
+      host_contact_id: client.client_id,
+      peer_contact_id: peer_id,
+      name: displayName,
+      type: SESSION_TYPE.PRIVATE,
+      status: SESSION_STATUS.ACTIVE,
+      created_at: Date.now()
+    });
+  } else {
+    session = db.createSession({
+      session_id,
+      host_contact_id: client.client_id,
+      peer_contact_id: peer_id,
+      name: displayName || session.name,
+      type: SESSION_TYPE.PRIVATE,
+      status: SESSION_STATUS.ACTIVE,
+      created_at: session.created_at || Date.now()
+    });
+  }
+
+  if (peer_id) {
+    db.upsertContact({
+      contact_id: peer_id,
+      nickname: sanitizeName(peer_nickname) || privateDisplayName(peer_id, peer_nickname),
+      last_seen_ip: peer_ip || null,
+      last_seen_at: Date.now()
+    });
+  }
+
+  const sendInvite = (port) => {
+    if (!port || !peer_ip || !peer_id) return;
+    net.sendPrivateInvite(peer_ip, {
+      to: peer_id,
+      session_id,
+      session_name: session.name || displayName,
+      message_port: port
+    });
+  };
+
+  if (net.isHosting(session_id)) {
+    sendInvite(net.getHostedPort(session_id));
+  } else {
+    if (net.isJoined(session_id)) net.leaveSession(session_id);
+    net.hostSession(session, 0, (finalPort) => sendInvite(finalPort));
+  }
+  return session;
+}
+
+function ensureLocalPrivateRecord({ session_id, peer_id, peer_nickname, host_contact_id, name }) {
+  const displayName = name || privateDisplayName(peer_id, peer_nickname);
+  let session = db.getSession(session_id);
+  if (!session) {
+    session = db.createSession({
+      session_id,
+      host_contact_id: host_contact_id || peer_id,
+      peer_contact_id: peer_id,
+      name: displayName,
+      type: SESSION_TYPE.PRIVATE,
+      status: SESSION_STATUS.ACTIVE,
+      created_at: Date.now()
+    });
+  } else {
+    session = db.createSession({
+      session_id,
+      host_contact_id: host_contact_id || session.host_contact_id || peer_id,
+      peer_contact_id: peer_id,
+      name: displayName || session.name,
+      type: SESSION_TYPE.PRIVATE,
+      status: SESSION_STATUS.ACTIVE,
+      created_at: session.created_at || Date.now()
+    });
+  }
+  if (peer_id) {
+    db.upsertContact({
+      contact_id: peer_id,
+      nickname: sanitizeName(peer_nickname) || displayName,
+      last_seen_ip: null,
+      last_seen_at: Date.now()
+    });
+  }
+  return session;
+}
+
+function flushPendingPrivateSends(session_id) {
+  const list = pendingPrivateSends.get(session_id);
+  if (!list || list.length === 0) return;
+  if (!net.isHosting(session_id) && !net.isJoined(session_id)) return;
+  pendingPrivateSends.delete(session_id);
+  for (const item of list) {
+    try {
+      const client = db.getClientInfo();
+      const msg = {
+        kind: 'msg',
+        message_id: item.message_id,
+        session_id,
+        sender_contact_id: client.client_id,
+        sender_nickname: client.nickname,
+        sender_ip: net.localIp,
+        content: item.content,
+        type: item.type || MSG_TYPE.TEXT,
+        timestamp: item.timestamp,
+        local_id: item.local_id
+      };
+      if (net.isHosting(session_id)) net.relayToMembers(session_id, msg);
+      else if (net.isJoined(session_id)) net.memberSend(session_id, msg);
+    } catch (e) {
+      console.error('[ipc] flushPendingPrivateSends error:', e);
+    }
+  }
+}
+
+function tryAutoReopenPrivateOnPeerOnline(peer) {
+  try {
+    if (!peer || !peer.client_id) return;
+    const client = db.getClientInfo();
+    if (!client || peer.client_id === client.client_id) return;
+    if (!db.hasPrivateHistory(peer.client_id)) return;
+
+    const session_id = privateSessionId(client.client_id, peer.client_id);
+    if (net.isHosting(session_id) || net.isJoined(session_id)) {
+      const s = db.getSession(session_id);
+      if (s && s.status !== SESSION_STATUS.ACTIVE) {
+        db.activateSession(session_id);
+        send(IPC_EVENT.SESSION_CREATED, { session_id, type: SESSION_TYPE.PRIVATE });
+      }
+      flushPendingPrivateSends(session_id);
+      return;
+    }
+
+    if (shouldHostPrivate(client.client_id, peer.client_id)) {
+      const session = ensureHostPrivateSession({
+        session_id,
+        peer_id: peer.client_id,
+        peer_ip: peer.ip,
+        peer_nickname: peer.nickname
+      });
+      send(IPC_EVENT.SESSION_CREATED, {
+        session_id: session.session_id,
+        name: session.name,
+        type: SESSION_TYPE.PRIVATE
+      });
+    } else {
+      const name = privateDisplayName(peer.client_id, peer.nickname);
+      ensureLocalPrivateRecord({
+        session_id,
+        peer_id: peer.client_id,
+        peer_nickname: peer.nickname,
+        host_contact_id: peer.client_id,
+        name
+      });
+      if (peer.ip) {
+        net.sendPrivateRequest(peer.ip, {
+          to: peer.client_id,
+          session_id,
+          session_name: name
+        });
+      }
+      send(IPC_EVENT.SESSION_CREATED, {
+        session_id,
+        name,
+        type: SESSION_TYPE.PRIVATE
+      });
+    }
+  } catch (e) {
+    console.error('[ipc] tryAutoReopenPrivateOnPeerOnline error:', e);
+  }
+}
+
+/** 打开/创建与某联系人的私聊 */
+function openPrivateSession({ peer_contact_id, peer_ip, peer_nickname }) {
+  const client = db.getClientInfo();
+  if (!client || !peer_contact_id) {
+    return { error: '缺少联系人' };
+  }
+  if (peer_contact_id === client.client_id) {
+    return { error: '不能与自己私聊' };
+  }
+
+  const session_id = privateSessionId(client.client_id, peer_contact_id);
+  const ip = resolvePeerIp(peer_contact_id, peer_ip);
+  const live = net.peers && net.peers.get ? net.peers.get(peer_contact_id) : null;
+  const nick = peer_nickname || (live && live.nickname) || null;
+  const name = privateDisplayName(peer_contact_id, nick);
+
+  if (net.isHosting(session_id) || net.isJoined(session_id)) {
+    let session = db.getSession(session_id);
+    if (!session || session.status !== SESSION_STATUS.ACTIVE) {
+      session = ensureLocalPrivateRecord({
+        session_id,
+        peer_id: peer_contact_id,
+        peer_nickname: nick,
+        host_contact_id: net.isHosting(session_id) ? client.client_id : peer_contact_id,
+        name
+      });
+    }
+    flushPendingPrivateSends(session_id);
+    return session;
+  }
+
+  if (shouldHostPrivate(client.client_id, peer_contact_id)) {
+    const session = ensureHostPrivateSession({
+      session_id,
+      peer_id: peer_contact_id,
+      peer_ip: ip,
+      peer_nickname: nick,
+      name
+    });
+    return session;
+  }
+
+  const session = ensureLocalPrivateRecord({
+    session_id,
+    peer_id: peer_contact_id,
+    peer_nickname: nick,
+    host_contact_id: peer_contact_id,
+    name
+  });
+  if (ip) {
+    net.sendPrivateRequest(ip, {
+      to: peer_contact_id,
+      session_id,
+      session_name: name
+    });
+  }
+  return session;
+}
+
+/** 私聊未连接时：本地入库 + 入待发队列 */
+function enqueueOfflinePrivate(session_id, content, type) {
+  if (typeof content === 'string' && content.length > MAX_MSG_CONTENT_LEN) {
+    return { error: '消息内容过长（上限 16KB）' };
+  }
+  const client = db.getClientInfo();
+  const message_id = uuidv4();
+  const local_id = uuidv4();
+  const timestamp = Date.now();
+  db.addMessage({
+    message_id,
+    session_id,
+    sender_contact_id: client.client_id,
+    content,
+    type,
+    timestamp,
+    local_id
+  });
+  try {
+    const s = db.getSession(session_id);
+    if (s && s.status !== SESSION_STATUS.ACTIVE) {
+      db.activateSession(session_id);
+    }
+  } catch {}
+  const list = pendingPrivateSends.get(session_id) || [];
+  list.push({ content, type, message_id, local_id, timestamp });
+  pendingPrivateSends.set(session_id, list);
+  return { message_id, timestamp, local_id, pending: true };
+}
+
 
 // V14：消息速率限制（10 msg/sec）与消息队列
 // 滑动窗口限速：1000ms 窗口内最多 MAX_MSG_PER_SEC 条
@@ -272,9 +571,14 @@ function registerNetworkEvents() {
       ip: peer.ip,
       online: true
     });
+    // 有私聊历史 → 自动重建连接
+    tryAutoReopenPrivateOnPeerOnline(peer);
   });
   net.on('peer-offline', ({ client_id }) => send(IPC_EVENT.PRESENCE_UPDATE, { client_id, online: false }));
-  net.on('joined', ({ session_id, members }) => send(IPC_EVENT.PRESENCE_UPDATE, { session_id, members }));
+  net.on('joined', ({ session_id, members }) => {
+    send(IPC_EVENT.PRESENCE_UPDATE, { session_id, members });
+    flushPendingPrivateSends(session_id);
+  });
   // 成员加入主机托管会话：主机把历史消息推送给新成员，解决"加入前消息看不到"
   net.on('member-joined', ({ session_id, client_id }) => {
     try {
@@ -312,6 +616,7 @@ function registerNetworkEvents() {
     } catch (e) {
       console.error('[ipc] member-joined history push error:', e);
     }
+    flushPendingPrivateSends(session_id);
   });
   // 私聊会话：任一方离线时主机自动解散 → 结束本地会话 + 通知渲染
   net.on('session-auto-end', ({ session_id }) => {
@@ -323,37 +628,85 @@ function registerNetworkEvents() {
   // 收到私聊邀请：自动加入 + 本地记录会话 + 通知渲染层
   net.on('private-invite', (invite) => {
     try {
-      // 建立 TCP 连接到主机
-      net.joinSession(invite.session_id, invite.host_ip, invite.message_port, (msg) => handleReceivedMessage(msg), {
+      const client = db.getClientInfo();
+      const peerId = invite.from && invite.from.client_id;
+      // 确定性 id：优先用双方 client_id 算出的 id；兼容旧 invite 自带的 session_id
+      const sid = (client && peerId)
+        ? privateSessionId(client.client_id, peerId)
+        : invite.session_id;
+
+      // 若本机已在 host 同 sid（竞态），忽略 join
+      if (net.isHosting(sid)) {
+        console.log('[ipc] private-invite ignored, already hosting', sid.slice(0, 8));
+        return;
+      }
+
+      net.joinSession(sid, invite.host_ip, invite.message_port, (msg) => handleReceivedMessage(msg), {
         file_port: invite.file_port
       });
-      // 本地记录会话
-      const existing = db.getSession(invite.session_id);
+
+      const displayName = invite.session_name || privateDisplayName(peerId, invite.from && invite.from.nickname);
+      const existing = db.getSession(sid);
       if (!existing) {
         db.createSession({
-          session_id: invite.session_id,
-          host_contact_id: invite.from.client_id,
-          name: invite.session_name,
+          session_id: sid,
+          host_contact_id: peerId,
+          peer_contact_id: peerId,
+          name: displayName,
           type: SESSION_TYPE.PRIVATE,
           status: SESSION_STATUS.ACTIVE,
           created_at: Date.now()
         });
-        // upsert 邀请人为联系人
+      } else {
+        db.createSession({
+          session_id: sid,
+          host_contact_id: peerId,
+          peer_contact_id: peerId,
+          name: displayName || existing.name,
+          type: SESSION_TYPE.PRIVATE,
+          status: SESSION_STATUS.ACTIVE,
+          created_at: existing.created_at || Date.now()
+        });
+      }
+      if (peerId) {
         db.upsertContact({
-          contact_id: invite.from.client_id,
-          nickname: invite.from.nickname,
-          last_seen_ip: invite.from.ip,
+          contact_id: peerId,
+          nickname: sanitizeName(invite.from && invite.from.nickname) || displayName,
+          last_seen_ip: invite.host_ip || (invite.from && invite.from.ip) || null,
           last_seen_at: Date.now()
         });
       }
-      // 通知渲染层：本地已新建会话（私聊已自动加入），刷新"我的会话"列表
       send(IPC_EVENT.SESSION_CREATED, {
-        session_id: invite.session_id,
-        name: invite.session_name,
+        session_id: sid,
+        name: displayName,
+        type: SESSION_TYPE.PRIVATE
+      });
+      setTimeout(() => flushPendingPrivateSends(sid), 500);
+    } catch (e) {
+      console.error('[ipc] private-invite handle error:', e);
+    }
+  });
+  // 收到私聊请求：本方建立 host 并回 invite
+  net.on('private-request', (req) => {
+    try {
+      const client = db.getClientInfo();
+      const peerId = req.from && req.from.client_id;
+      if (!client || !peerId) return;
+      const sid = req.session_id || privateSessionId(client.client_id, peerId);
+      const session = ensureHostPrivateSession({
+        session_id: sid,
+        peer_id: peerId,
+        peer_ip: req.peer_ip || (req.from && req.from.ip),
+        peer_nickname: req.from && req.from.nickname,
+        name: req.session_name
+      });
+      send(IPC_EVENT.SESSION_CREATED, {
+        session_id: session.session_id,
+        name: session.name,
         type: SESSION_TYPE.PRIVATE
       });
     } catch (e) {
-      console.error('[ipc] private-invite handle error:', e);
+      console.error('[ipc] private-request handle error:', e);
     }
   });
   net.on('file-uploaded', (info) => {
@@ -429,6 +782,14 @@ function registerIpcHandlers() {
   ipcMain.handle(IPC.CONTACTS_LIST, () => db.listContacts());
   ipcMain.handle(IPC.CONTACTS_SET_ALIAS, (_e, { contact_id, alias }) => {
     db.setAlias(contact_id, alias);
+    try {
+      const s = db.findPrivateSession(contact_id);
+      if (s) {
+        const c = db.listContacts().find((x) => x.contact_id === contact_id);
+        const name = (alias && String(alias).trim()) || (c && c.nickname) || s.name;
+        db.activateSession(s.session_id, { name: sanitizeSessionName(name) || s.name });
+      }
+    } catch {}
     return db.listContacts();
   });
   ipcMain.handle(IPC.CONTACTS_DELETE, (_e, { contact_id }) => {
@@ -437,6 +798,14 @@ function registerIpcHandlers() {
   });
   // ---- 会话 ----
   ipcMain.handle(IPC.SESSION_CREATE, (_e, { name, type, invitee_ip, invitee_client_id }) => {
+    // 私聊请走 SESSION_OPEN_PRIVATE；此处若仍收到 private 则兼容旧路径
+    if (type === SESSION_TYPE.PRIVATE && invitee_client_id) {
+      return openPrivateSession({
+        peer_contact_id: invitee_client_id,
+        peer_ip: invitee_ip,
+        peer_nickname: null
+      });
+    }
     const client = db.getClientInfo();
     const session_id = uuidv4();
     const now = Date.now();
@@ -445,25 +814,16 @@ function registerIpcHandlers() {
       session_id,
       host_contact_id: client.client_id,
       name: cleanName,
-      type,
+      type: type || SESSION_TYPE.GROUP,
       status: SESSION_STATUS.ACTIVE,
       created_at: now
     });
-    // 作为主机托管：监听 TCP 端口
-    // 私聊邀请必须在 listen 成功后发送（否则被邀请方 TCP 连接会被拒绝）
-    const isPrivateInvite = type === SESSION_TYPE.PRIVATE && invitee_ip && invitee_client_id;
-    net.hostSession(session, 0, (finalPort) => {
-      if (isPrivateInvite && finalPort) {
-        net.sendPrivateInvite(invitee_ip, {
-          to: invitee_client_id,
-          session_id,
-          session_name: name,
-          message_port: finalPort
-        });
-      }
-    });
+    net.hostSession(session, 0, () => {});
     return session;
   });
+
+  // 打开/创建与某联系人的私聊（确定性 id + 主机选举）
+  ipcMain.handle(IPC.SESSION_OPEN_PRIVATE, (_e, payload) => openPrivateSession(payload || {}));
 
   ipcMain.handle(IPC.SESSION_CLOSE, (_e, session_id) => {
     const now = Date.now();
@@ -510,6 +870,7 @@ function registerIpcHandlers() {
       db.createSession({
         session_id,
         host_contact_id: existing.host_contact_id,
+        peer_contact_id: existing.peer_contact_id,
         name: existing.name,
         type: existing.type,
         status: SESSION_STATUS.ACTIVE,
@@ -521,15 +882,32 @@ function registerIpcHandlers() {
 
   // ---- 消息 ----
   ipcMain.handle(IPC.MESSAGE_SEND, async (_e, { session_id, content, type }) => {
-    // 校验会话状态：ended 或未 host/join 则拒绝发送
     const session = db.getSession(session_id);
-    if (session && session.status === SESSION_STATUS.ENDED) {
+    // 群聊 ended：拒绝
+    if (session && session.status === SESSION_STATUS.ENDED && session.type !== SESSION_TYPE.PRIVATE) {
       return { error: '会话已结束' };
     }
-    if (!net.isHosting(session_id) && !net.isJoined(session_id)) {
-      return { error: '未连接到会话' };
+    // 已连接：正常发送
+    if (net.isHosting(session_id) || net.isJoined(session_id)) {
+      return enqueueMessage(session_id, content, type || MSG_TYPE.TEXT);
     }
-    return enqueueMessage(session_id, content, type);
+    // 私聊未连接：本地先存 + 待发；并尝试触发建连
+    if (session && session.type === SESSION_TYPE.PRIVATE) {
+      const result = enqueueOfflinePrivate(session_id, content, type || MSG_TYPE.TEXT);
+      try {
+        if (session.peer_contact_id) {
+          const peerIp = resolvePeerIp(session.peer_contact_id);
+          const peer = net.peers && net.peers.get ? net.peers.get(session.peer_contact_id) : null;
+          tryAutoReopenPrivateOnPeerOnline({
+            client_id: session.peer_contact_id,
+            nickname: peer && peer.nickname,
+            ip: peerIp || (peer && peer.ip)
+          });
+        }
+      } catch {}
+      return result;
+    }
+    return { error: '未连接到会话' };
   });
 
   ipcMain.handle(IPC.MESSAGE_LIST, (_e, session_id) => db.listMessages(session_id));

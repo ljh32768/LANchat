@@ -35,6 +35,23 @@ export const useSessionsStore = create(
       return session;
     },
 
+    // 打开/创建与某联系人的私聊（私聊通过联系人点击进入）
+    openPrivate: async (peer_contact_id, peer_nickname) => {
+      try {
+        const result = await window.api.invoke('session:open-private', { peer_contact_id, peer_nickname });
+        if (result && result.error) {
+          console.error('[openPrivate] error:', result.error);
+          return { error: result.error };
+        }
+        const session = result;
+        set({ sessions: [session, ...get().sessions], activeSessionId: session.session_id });
+        return session;
+      } catch (e) {
+        console.error('[openPrivate] error:', e);
+        return { error: e.message };
+      }
+    },
+
     join: async (session) => {
       await window.api.invoke('session:join', {
         session_id: session.session_id,
@@ -83,7 +100,7 @@ export const useSessionsStore = create(
       }
     },
 
-    // 仅从“局域网发现”列表移除；不把本地活跃会话标为 ended
+    // 仅从”局域网发现”列表移除；不把本地活跃会话标为 ended
     // （UDP 超时/扫表也会发 session-removed，真正结束走 session:ended）
     removeDiscovered: (sessionId) => {
       set({ discovered: get().discovered.filter((s) => s.session_id !== sessionId) });

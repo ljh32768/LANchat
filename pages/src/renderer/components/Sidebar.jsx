@@ -13,6 +13,7 @@ export default function Sidebar({ onNewSession }) {
   const activeSessionId = useSessionsStore((s) => s.activeSessionId);
   const unread = useSessionsStore((s) => s.unread);
   const setActive = useSessionsStore((s) => s.setActive);
+  const openPrivate = useSessionsStore((s) => s.openPrivate);
   const join = useSessionsStore((s) => s.join);
   const remove = useSessionsStore((s) => s.remove);
   const contacts = useContactsStore((s) => s.contacts);
@@ -33,7 +34,14 @@ export default function Sidebar({ onNewSession }) {
     await loadMessages(s.session_id);
   };
 
-  const activeSessions = sessions.filter((s) => s.status === 'active');
+  // 当前活跃私聊的对方 contact_id（用于联系人高亮）
+  const activeSession = sessions.find((s) => s.session_id === activeSessionId);
+  const activePrivatePeer = activeSession && activeSession.type === 'private'
+    ? (activeSession.host_contact_id === clientId ? activeSession.peer_contact_id : activeSession.host_contact_id)
+    : null;
+
+  // 仅显示群聊活跃会话；私聊不在此列表
+  const activeSessions = sessions.filter((s) => s.status === 'active' && s.type !== 'private');
   const endedSessions = sessions.filter((s) => s.status === 'ended');
   const joinedIds = new Set(sessions.map((s) => s.session_id));
   const discoverable = discovered.filter((s) => !joinedIds.has(s.session_id) && s.host_contact_id !== clientId && s.type !== 'private');
@@ -99,18 +107,32 @@ export default function Sidebar({ onNewSession }) {
 
         <Section title={t('sidebar.contacts')} count={contacts.length}>
           {contacts.length === 0 && <Empty text={t('sidebar.noContacts')} />}
-          {contacts.map((c) => (
-            <ContactItem
-              key={c.contact_id}
-              contact={c}
-              peers={peers}
-              contacts={contacts}
-              online={onlineIds.has(c.contact_id)}
-              self={c.contact_id === clientId}
-              onSetAlias={setAlias}
-              onDeleteContact={deleteContact}
-            />
-          ))}
+          {contacts.map((c) => {
+            // 找到该联系人的私聊 session 以显示未读
+            const privateSession = sessions.find(
+              (s) => s.type === 'private' &&
+                (s.host_contact_id === c.contact_id || s.peer_contact_id === c.contact_id)
+            );
+            const privateUnread = privateSession ? (unread[privateSession.session_id] || 0) : 0;
+            return (
+              <ContactItem
+                key={c.contact_id}
+                contact={c}
+                peers={peers}
+                contacts={contacts}
+                online={onlineIds.has(c.contact_id)}
+                self={c.contact_id === clientId}
+                active={activePrivatePeer === c.contact_id}
+                unread={privateUnread}
+                onOpenPrivate={async () => {
+                  const s = await openPrivate(c.contact_id, c.nickname);
+                  if (s && !s.error) await loadMessages(s.session_id);
+                }}
+                onSetAlias={setAlias}
+                onDeleteContact={deleteContact}
+              />
+            );
+          })}
         </Section>
       </div>
     </aside>
@@ -159,7 +181,7 @@ function DiscoveredItem({ name, type, members, onClick }) {
   );
 }
 
-function ContactItem({ contact, peers, contacts, online, self, onSetAlias, onDeleteContact }) {
+function ContactItem({ contact, peers, contacts, online, self, active, unread, onOpenPrivate, onSetAlias, onDeleteContact }) {
   const t = useT();
   const [editing, setEditing] = useState(false);
   const [aliasInput, setAliasInput] = useState('');
@@ -183,7 +205,12 @@ function ContactItem({ contact, peers, contacts, online, self, onSetAlias, onDel
   };
 
   return (
-    <div className={`sb-item contact ${identity.level >= 3 ? 'warn' : ''}`} title={identity.tooltip || ''}>
+    <div
+      className={`sb-item contact ${identity.level >= 3 ? 'warn' : ''} ${!self ? 'clickable' : ''} ${active ? 'active' : ''}`}
+      title={identity.tooltip || ''}
+      role={!self ? 'button' : undefined}
+      onClick={!self ? () => onOpenPrivate(contact) : undefined}
+    >
       <span className={`sb-dot ${online ? 'on' : 'off'}`} />
       {editing ? (
         <input
@@ -209,10 +236,11 @@ function ContactItem({ contact, peers, contacts, online, self, onSetAlias, onDel
           </span>
           {!self && (
             <div className="sb-contact-actions">
-              <button className="sb-action" title={t('sidebar.editAlias')} onClick={startEdit}>✎</button>
-              <button className="sb-action sb-del-action" title={t('sidebar.deleteContact')} onClick={() => onDeleteContact(contact.contact_id)}>✕</button>
+              <button className="sb-action" title={t('sidebar.editAlias')} onClick={(e) => { e.stopPropagation(); startEdit(); }}>✎</button>
+              <button className="sb-action sb-del-action" title={t('sidebar.deleteContact')} onClick={(e) => { e.stopPropagation(); onDeleteContact(contact.contact_id); }}>✕</button>
             </div>
           )}
+          {!self && unread > 0 && <span className="sb-unread">{unread}</span>}
         </>
       )}
     </div>

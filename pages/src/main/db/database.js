@@ -134,7 +134,21 @@ function runMigrations() {
     version = 3;
   }
 
-  // 未来迁移在此追加：if (version < 4) { ... version = 4; }
+  // v4: sessions.peer_contact_id —— 私聊绑定对方联系人，支持按联系人反查
+  if (version < 4) {
+    try {
+      const cols = query('PRAGMA table_info(sessions)');
+      if (cols.length > 0 && !cols.some((c) => c.name === 'peer_contact_id')) {
+        execute('ALTER TABLE sessions ADD COLUMN peer_contact_id TEXT');
+      }
+      execute('CREATE INDEX IF NOT EXISTS idx_sessions_peer ON sessions(peer_contact_id, type, status)');
+    } catch (e) {
+      console.error('[db] migration v4 failed:', e);
+    }
+    version = 4;
+  }
+
+  // 未来迁移在此追加：if (version < 5) { ... version = 5; }
 
   if (db) db.run(`PRAGMA user_version = ${version};`);
   console.log('[db] migrations done, user_version =', version);
@@ -303,12 +317,61 @@ function getSession(session_id) {
   return queryOne('SELECT * FROM sessions WHERE session_id = ?', [session_id]);
 }
 
-function createSession({ session_id, host_contact_id, name, type, status, created_at }) {
+function createSession({ session_id, host_contact_id, name, type, status, created_at, peer_contact_id = null }) {
   // 用 INSERT OR REPLACE：重新加入已退出过的会话时覆盖旧记录，保留关联的消息历史
+  // peer_contact_id：私聊绑定对方；若 REPLACE 时未传则尽量保留旧值
+  const existing = getSession(session_id);
+  const peer = peer_contact_id != null
+    ? peer_contact_id
+    : (existing?.peer_contact_id || null);
+  const created = created_at || existing?.created_at || Date.now();
   execute(
-    `INSERT OR REPLACE INTO sessions (session_id, host_contact_id, name, type, status, created_at, ended_at)
-     VALUES (?, ?, ?, ?, ?, ?, NULL)`,
-    [session_id, host_contact_id, name, type, status, created_at]
+    `INSERT OR REPLACE INTO sessions (session_id, host_contact_id, peer_contact_id, name, type, status, created_at, ended_at, last_activity_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+    [session_id, host_contact_id, peer, name, type, status, created, Date.now()]
+  );
+  return getSession(session_id);
+}
+
+// 按对方联系人查找私聊：优先 active，其次最近一条（含 ended，用于历史/重建）
+function findPrivateSession(peer_contact_id) {
+  if (!peer_contact_id) return null;
+  const active = queryOne(
+    `SELECT * FROM sessions
+     WHERE type = 'private' AND peer_contact_id = ? AND status = 'active'
+     ORDER BY COALESCE(last_activity_at, created_at) DESC LIMIT 1`,
+    [peer_contact_id]
+  );
+  if (active) return active;
+  return queryOne(
+    `SELECT * FROM sessions
+     WHERE type = 'private' AND peer_contact_id = ?
+     ORDER BY COALESCE(last_activity_at, created_at) DESC LIMIT 1`,
+    [peer_contact_id]
+  );
+}
+
+// 是否曾与该联系人建立过私聊（有会话记录即视为有历史，触发上线自动重建）
+function hasPrivateHistory(peer_contact_id) {
+  if (!peer_contact_id) return false;
+  const row = queryOne(
+    `SELECT session_id FROM sessions WHERE type = 'private' AND peer_contact_id = ? LIMIT 1`,
+    [peer_contact_id]
+  );
+  return !!row;
+}
+
+// 将会话重新标为 active（断线后重建用，保留 created_at / peer / name）
+function activateSession(session_id, { host_contact_id, name } = {}) {
+  const s = getSession(session_id);
+  if (!s) return null;
+  execute(
+    `UPDATE sessions SET status = 'active', ended_at = NULL,
+       host_contact_id = COALESCE(?, host_contact_id),
+       name = COALESCE(?, name),
+       last_activity_at = ?
+     WHERE session_id = ?`,
+    [host_contact_id || null, name || null, Date.now(), session_id]
   );
   return getSession(session_id);
 }
@@ -489,6 +552,9 @@ module.exports = {
   touchSession,
   getSession,
   createSession,
+  findPrivateSession,
+  hasPrivateHistory,
+  activateSession,
   closeSession,
   leaveSession,
   deleteSession,

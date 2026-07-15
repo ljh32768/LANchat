@@ -1,25 +1,20 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { SESSION_STATUS } from '../constants';
 import { useSessionsStore } from '../stores/useSessionsStore';
 import { useMessagesStore } from '../stores/useMessagesStore';
 import { useClientStore } from '../stores/useClientStore';
 import { useContactsStore } from '../stores/useContactsStore';
-import { useFilesStore } from '../stores/useFilesStore';
 import { useT } from '../locales/useLocale';
 import MessageBubble from './MessageBubble';
 import MessageInput from './MessageInput';
 
-// 文件传输默认端口（与 shared/constants 的 TCP_FILE_PORT_BASE 一致）
-// 实际使用时优先从 discovered session 的 file_port 获取
 const DEFAULT_FILE_PORT = 47890;
-// 稳定引用的空数组，避免 selector 在消息未加载时每次渲染创建新引用导致无限重渲染
 const EMPTY_MESSAGES = [];
 
 export default function ChatView() {
   const t = useT();
   const activeSessionId = useSessionsStore((s) => s.activeSessionId);
   const sessions = useSessionsStore((s) => s.sessions);
-  const discovered = useSessionsStore((s) => s.discovered);
   const close = useSessionsStore((s) => s.close);
   const leave = useSessionsStore((s) => s.leave);
   const messages = useMessagesStore((s) =>
@@ -29,23 +24,21 @@ export default function ChatView() {
   const selfIp = useClientStore((s) => s.ip);
   const contacts = useContactsStore((s) => s.contacts);
   const peers = useContactsStore((s) => s.peers);
+  const setAlias = useContactsStore((s) => s.setAlias);
   const scrollRef = useRef(null);
+
+  // hooks 必须在顶层无条件调用
+  const [editingAlias, setEditingAlias] = useState(false);
+  const [aliasInput, setAliasInput] = useState('');
 
   const session = sessions.find((s) => s.session_id === activeSessionId);
 
-  // 自动滚动到底部（原生滚动，无虚拟列表双重渲染）
+  // 自动滚动到底部
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages.length, activeSessionId]);
-
-  // 切换会话时从 DB 恢复文件状态（避免重启后状态丢失）
-  useEffect(() => {
-    if (activeSessionId) {
-      useFilesStore.getState().loadSessionFiles(activeSessionId);
-    }
-  }, [activeSessionId]);
 
   if (!session) {
     return (
@@ -60,30 +53,76 @@ export default function ChatView() {
   }
 
   const isHost = session.host_contact_id === clientId;
+  const isPrivate = session.type === 'private';
   const ended = session.status === SESSION_STATUS.ENDED;
-  const hostInfo = discovered.find((d) => d.session_id === session.session_id);
-  // 主机不在自己的 discovered 列表中，下载文件时回退使用本机 IP
+  const hostInfo = sessions.find((d) => d.session_id === session.session_id);
   const hostIp = hostInfo?.host_ip || (isHost ? selfIp : undefined);
-  // 文件端口：优先从 discovered session 获取，主机回退到默认端口
   const filePort = hostInfo?.file_port || DEFAULT_FILE_PORT;
+
+  // 获取对方展示名（备注优先，否则昵称）
+  const peerDisplayName = isPrivate
+    ? (() => {
+        const peerId = isHost ? session.peer_contact_id : session.host_contact_id;
+        const peer = contacts.find((c) => c.contact_id === peerId);
+        return peer?.alias || peer?.nickname || session.name;
+      })()
+    : session.name;
+
+  // 备注保存
+  const saveAlias = () => {
+    const trimmed = aliasInput.trim();
+    setAliasInput(trimmed);
+    setEditingAlias(false);
+    if (isPrivate && trimmed) {
+      const peerId = isHost ? session.peer_contact_id : session.host_contact_id;
+      setAlias(peerId, trimmed || null);
+    }
+  };
+
+  // 初始化编辑
+  const startEditAlias = () => {
+    const peerId = isHost ? session.peer_contact_id : session.host_contact_id;
+    const peer = contacts.find((c) => c.contact_id === peerId);
+    setAliasInput(peer?.alias || '');
+    setEditingAlias(true);
+  };
 
   return (
     <main className="chat-view">
       <header className="chat-header">
         <div className="chat-title">
-          <span className="chat-type">{session.type === 'private' ? t('chatview.privateTag') : t('chatview.groupTag')}</span>
-          <span className="chat-name">{session.name}</span>
+          <span className="chat-type">{isPrivate ? t('chatview.privateTag') : t('chatview.groupTag')}</span>
+          {editingAlias && isPrivate ? (
+            <input
+              className="chat-alias-input"
+              autoFocus
+              value={aliasInput}
+              placeholder={t('sidebar.aliasPlaceholder')}
+              onChange={(e) => setAliasInput(e.target.value)}
+              onBlur={saveAlias}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') saveAlias();
+                if (e.key === 'Escape') setEditingAlias(false);
+              }}
+            />
+          ) : (
+            <span className="chat-name">{peerDisplayName}</span>
+          )}
+          {isPrivate && !editingAlias && (
+            <button className="chat-alias-btn" title={t('chatview.editAlias')} onClick={startEditAlias} disabled={ended}>
+              ✎
+            </button>
+          )}
           {isHost && <span className="chat-host">{t('chatview.hostTag')}</span>}
           {ended && <span className="chat-ended-tag">{t('chatview.endedTag')}</span>}
         </div>
-        {!ended && (
-          <button
-            className="chat-close"
-            onClick={() => (isHost ? close(session.session_id) : leave(session.session_id))}
-          >
-            {isHost ? t('chatview.closeSession') : t('chatview.leaveSession')}
-          </button>
-        )}
+        <button
+          className="chat-close"
+          onClick={() => (isHost ? close(session.session_id) : leave(session.session_id))}
+          disabled={ended}
+        >
+          {isHost ? t('chatview.closeSession') : t('chatview.leaveSession')}
+        </button>
       </header>
 
       <div className="chat-messages" ref={scrollRef}>

@@ -272,7 +272,7 @@ class NetworkManager extends EventEmitter {
       return;
     }
     // V10：未知包类型告警
-    if (!packet || !['presence', 'session_end', 'private_invite'].includes(packet.type)) {
+    if (!packet || !['presence', 'session_end', 'private_invite', 'private_request'].includes(packet.type)) {
       console.warn('[net] unknown packet type', packet?.type, 'from', rinfo.address);
       return;
     }
@@ -364,6 +364,23 @@ class NetworkManager extends EventEmitter {
           from: packet.from
         });
       }
+    } else if (packet.type === PACKET.PRIVATE_REQUEST) {
+      // 私聊请求：非主机方请求本机（主机方）建立/邀请私聊
+      console.log('[net] recv PRIVATE_REQUEST from', rinfo.address, 'to', packet.to, 'sid', (packet.session_id || '').slice(0, 8));
+      if (packet.to === this.clientInfo.client_id) {
+        this.peers.set(packet.from.client_id, {
+          client_id: packet.from.client_id,
+          nickname: packet.from.nickname,
+          ip: rinfo.address,
+          last_seen: Date.now()
+        });
+        this.emit('private-request', {
+          session_id: packet.session_id,
+          session_name: packet.session_name,
+          peer_ip: rinfo.address,
+          from: packet.from
+        });
+      }
     }
   }
 
@@ -395,6 +412,33 @@ class NetworkManager extends EventEmitter {
     for (const t of this.getBroadcastTargets()) {
       this.udpSocket.send(msg, 0, msg.length, UDP_BROADCAST_PORT, t.broadcast, (err) => {
         if (err) console.error('[net] sendPrivateInvite bcast fail', t.broadcast, err.code, err.message);
+      });
+    }
+  }
+
+  // 发送私聊请求：请对方（应为主机）建立会话并回 PRIVATE_INVITE
+  sendPrivateRequest(targetIp, req) {
+    if (!this.udpSocket) return;
+    const packet = {
+      type: PACKET.PRIVATE_REQUEST,
+      client_id: this.clientInfo.client_id,
+      from: {
+        client_id: this.clientInfo.client_id,
+        nickname: this.clientInfo.nickname,
+        ip: this.localIp
+      },
+      to: req.to,
+      session_id: req.session_id,
+      session_name: req.session_name
+    };
+    const msg = Buffer.from(JSON.stringify(packet));
+    console.log('[net] sendPrivateRequest to', targetIp, 'sid', (req.session_id || '').slice(0, 8));
+    this.udpSocket.send(msg, 0, msg.length, UDP_BROADCAST_PORT, targetIp, (err) => {
+      if (err) console.error('[net] sendPrivateRequest unicast fail', targetIp, err.code, err.message);
+    });
+    for (const t of this.getBroadcastTargets()) {
+      this.udpSocket.send(msg, 0, msg.length, UDP_BROADCAST_PORT, t.broadcast, (err) => {
+        if (err) console.error('[net] sendPrivateRequest bcast fail', t.broadcast, err.code, err.message);
       });
     }
   }

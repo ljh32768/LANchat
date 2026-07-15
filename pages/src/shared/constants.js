@@ -11,7 +11,8 @@ const TCP_FILE_PORT_BASE = 47890;      // 文件传输 TCP 端口起始（主机
 const PACKET = {
   PRESENCE: 'presence',       // 在线状态 + 会话列表
   SESSION_END: 'session_end', // 会话结束通知
-  PRIVATE_INVITE: 'private_invite' // 私聊邀请（单播）
+  PRIVATE_INVITE: 'private_invite', // 私聊邀请（单播）：主机 → 成员
+  PRIVATE_REQUEST: 'private_request' // 私聊请求（单播）：非主机方点击时请求对方建主机
 };
 
 // ---- Message types ----
@@ -49,6 +50,7 @@ const IPC = {
   CONTACTS_DELETE: 'contacts:delete',
   // 会话
   SESSION_CREATE: 'session:create',
+  SESSION_OPEN_PRIVATE: 'session:open-private', // 打开/创建与某联系人的私聊（确定性 id）
   SESSION_CLOSE: 'session:close', // 主机关闭会话（会话结束，通知所有成员）
   SESSION_LEAVE: 'session:leave', // 成员退出会话（仅自己离开，会话继续）
   SESSION_DELETE: 'session:delete', // 删除已结束会话（级联清理消息+文件记录）

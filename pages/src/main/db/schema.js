@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS contacts (
 CREATE TABLE IF NOT EXISTS sessions (
   session_id        TEXT PRIMARY KEY,
   host_contact_id   TEXT,
+  peer_contact_id   TEXT,
   name              TEXT,
   type              TEXT,
   status            TEXT,
